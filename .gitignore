@@ -4,6 +4,6 @@ dist/*.png
 __pycache__/
 *.pyc
 .DS_Store
-# eigene (echte) Avis-PDFs niemals committen
-test/fixtures/real_*.pdf
+# keine PDFs committen: Test-PDFs bleiben lokal, echte Avise sowieso
+*.pdf
 test/private/

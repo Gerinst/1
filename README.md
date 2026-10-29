@@ -2,7 +2,7 @@
 
 Klick-für-Klick-Anleitung für den Flow: [docs/ANLEITUNG.md](docs/ANLEITUNG.md). Übersicht aller Aktionen und Felder: `dist/avis-flow.html` (im Browser öffnen).
 
-Datenschutz: Das Repository enthält nur synthetische Test-PDFs. Echte Zahlungsavise gehören nicht ins Repo (siehe `.gitignore`).
+Datenschutz: Das Repository enthält keine PDFs. Test-PDFs und echte Zahlungsavise bleiben lokal (`*.pdf` steht in der `.gitignore`).
 
 Ein Office Script (TypeScript, ohne Libraries, ohne Netzwerk), das in Power Automate über **Excel Online (Business) → „Skript ausführen"** läuft, den eingebetteten Text einer PDF ausliest und den **Gesamt-/Zahlbetrag** findet. Standard-Connector, keine AI-Builder-Credits, keine Drittanbieter.
 
@@ -139,7 +139,7 @@ node test/run.js
 node test/run.js meine-datei
 ```
 
-`build.sh` setzt die Teile aus `src/` zu `dist/AvisPdfAmount.ts` zusammen (das ist die Datei fürs Office-Script-Fenster) und prüft sie mit `tsc --strict`. `test/run.js` führt das kompilierte Skript gegen alle PDFs in `test/fixtures/` aus und vergleicht mit `expected.json`. Eigene Avis-PDFs einfach dort ablegen und in `expected.json` eintragen.
+`build.sh` setzt die Teile aus `src/` zu `dist/AvisPdfAmount.ts` zusammen (das ist die Datei fürs Office-Script-Fenster) und prüft sie mit `tsc --strict`. `test/run.js` führt das kompilierte Skript gegen alle PDFs in `test/fixtures/` aus und vergleicht mit `expected.json`. Eigene Avis-PDFs einfach dort ablegen und in `expected.json` eintragen. Die Test-PDFs selbst liegen nicht im Repo; fehlende PDFs überspringt `test/run.js`.
 
 ## Plattform-Limits (Microsoft)
 
