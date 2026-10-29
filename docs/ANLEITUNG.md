@@ -26,7 +26,7 @@ Diese vier Dinge müssen vor dem Flow-Umbau existieren.
 2. Oben im Menüband auf den Reiter **Automatisieren** klicken. (Fehlt der Reiter: Office Scripts ist im Tenant gesperrt, dann muss die IT es freischalten.)
 3. Auf **Neues Skript** klicken. Rechts öffnet sich der Code-Editor mit einem Beispielskript.
 4. Im Editor alles markieren (Strg+A) und löschen.
-5. Die Datei `AvisPdfAmount.ts` mit dem Editor öffnen, alles markieren (Strg+A), kopieren (Strg+C), im Excel-Editor einfügen (Strg+V).
+5. Den kompletten Inhalt der Datei `AvisPdfAmount.ts` kopieren: Auf GitHub die Datei öffnen und oben rechts auf **Copy raw file** klicken (Symbol mit den zwei Rechtecken). Liegt die Datei bei dir auf dem Rechner, sie mit einem Texteditor öffnen, alles markieren (Strg+A) und kopieren (Strg+C). Dann im Excel-Editor einfügen (Strg+V).
 6. Oben im Editor auf den Skriptnamen („Skript 1") klicken und in **AvisPdfAmount** umbenennen.
 7. **Skript speichern** klicken. Das Skript liegt jetzt in deinem OneDrive unter Dokumente/Office Scripts.
 8. Kontrolle: Unter dem Editor darf keine rote Fehlermeldung stehen. Ein Klick auf „Ausführen" ist nicht nötig.

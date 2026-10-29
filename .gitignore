@@ -1,9 +1,0 @@
-node_modules/
-dist/js/
-dist/*.png
-__pycache__/
-*.pyc
-.DS_Store
-# keine PDFs committen: Test-PDFs bleiben lokal, echte Avise sowieso
-*.pdf
-test/private/
