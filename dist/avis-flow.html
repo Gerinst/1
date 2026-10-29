@@ -1,0 +1,246 @@
+<title>Avis-Flow</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one vertical flow lane, nested dashed scopes like the Power Automate designer, branches side by side on wide screens */
+:root {
+  --bg: #f6f5f1; --fg: #1f2328; --muted: #5d6470; --line: #d9d6cd; --card: #ffffff;
+  --cond: #4a3f9c; --cond-bg: #ecebf7; --true: #0f7a62; --true-bg: #e7f4ef; --false: #8a5a18; --false-bg: #f8eedc;
+  --new: #b43f1a; --new-bg: #fbe9e1; --code-bg: #f0eee8; --arrow: #8c8a82;
+  --font: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; --mono: "IBM Plex Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #15171b; --fg: #e8e6df; --muted: #a2a59f; --line: #353941; --card: #1e2126;
+  --cond: #b7aef5; --cond-bg: #26244a; --true: #6fd3b6; --true-bg: #163229; --false: #e6b56a; --false-bg: #3a2c15;
+  --new: #f2957a; --new-bg: #452219; --code-bg: #262a31; --arrow: #7c8088; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #15171b; --fg: #e8e6df; --muted: #a2a59f; --line: #353941; --card: #1e2126;
+  --cond: #b7aef5; --cond-bg: #26244a; --true: #6fd3b6; --true-bg: #163229; --false: #e6b56a; --false-bg: #3a2c15;
+  --new: #f2957a; --new-bg: #452219; --code-bg: #262a31; --arrow: #7c8088; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 15px; line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 24px 48px; }
+main { max-width: 980px; margin: 0 auto; }
+h1 { font-size: 26px; font-weight: 600; margin: 0 0 4px; text-wrap: balance; }
+h1 + p { margin: 0 0 16px; color: var(--muted); max-width: 70ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--muted); margin-bottom: 20px; }
+.legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid var(--line); background: var(--card); }
+.legend .l-new::before { background: var(--new-bg); border-color: var(--new); }
+.legend .l-cond::before { background: var(--cond-bg); border-color: var(--cond); }
+.legend .l-scope::before { border-style: dashed; border-color: var(--true); background: transparent; }
+.note { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin: 0 0 22px; font-size: 14px; }
+.note code { background: transparent; padding: 0; }
+.lane { display: flex; flex-direction: column; align-items: stretch; }
+.step { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 12px; }
+.step.cond { background: var(--cond-bg); border-color: var(--cond); }
+.step.new { background: var(--new-bg); border-color: var(--new); }
+.eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 2px; display: flex; gap: 8px; align-items: center; }
+.tag { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; border-radius: 999px; padding: 1px 8px; border: 1px solid currentColor; }
+.tag.new { color: var(--new); } .tag.keep { color: var(--true); }
+.step h2 { font-size: 17px; font-weight: 600; margin: 0 0 6px; }
+.step.cond h2 { color: var(--cond); }
+.fields { display: grid; grid-template-columns: minmax(120px, 170px) 1fr; gap: 4px 12px; font-size: 14px; margin: 4px 0 0; }
+.fields dt { color: var(--muted); margin: 0; }
+.fields dd { margin: 0; min-width: 0; }
+code { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); padding: 2px 5px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; display: inline-block; max-width: 100%; }
+pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); padding: 8px 10px; border-radius: 6px; margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; }
+.arrow { width: 2px; height: 22px; background: var(--arrow); margin: 0 auto; position: relative; }
+.arrow::after { content: ""; position: absolute; left: -4px; bottom: 0; border: 5px solid transparent; border-top: 7px solid var(--arrow); border-bottom: 0; }
+.scope { border: 1.5px dashed var(--true); background: var(--true-bg); border-radius: 12px; padding: 12px; margin-top: 0; }
+.scope.loop { border-color: var(--muted); background: transparent; }
+.scope.false { border-color: var(--false); background: var(--false-bg); }
+.scope > .label { font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--true); margin: 0 0 10px; }
+.scope.loop > .label { color: var(--muted); } .scope.false > .label { color: var(--false); }
+.branches { display: grid; grid-template-columns: 1fr; gap: 12px; }
+@media (min-width: 720px) { .branches { grid-template-columns: 1fr 1fr; } .branches.uneven { grid-template-columns: minmax(0, 1fr) 200px; } .branches.stack { grid-template-columns: 1fr; } }
+.empty { color: var(--muted); font-size: 14px; }
+.setup { margin-top: 36px; border-top: 1px solid var(--line); padding-top: 18px; }
+.setup h2 { font-size: 18px; font-weight: 600; margin: 0 0 8px; }
+.setup ol { margin: 0; padding-left: 20px; } .setup li { margin-bottom: 6px; }
+.limits { color: var(--muted); font-size: 13px; margin-top: 12px; }
+</style>
+<main>
+<h1>Avis-Flow</h1>
+<p>Vollständiger Aufbau des Power-Automate-Flows: Zahlungsavis-PDF aus der Mail lesen, Betrag erkennen, Weiterleitung mit Betrag im Betreff, Original-Mail kategorisieren.</p>
+<div class="legend"><span>bestehende Aktion</span><span class="l-new">neue Aktion</span><span class="l-cond">Bedingung</span><span class="l-scope">Zweig / Schleife (gestrichelt)</span></div>
+<div class="note">Die Ausdrücke unten setzen diese Aktionsnamen voraus (umbenennen, ohne Umlaute und Leerzeichen): Schleife = <code>Apply_to_each</code>, Anlage abrufen = <code>Get_attachment</code>, Skript = <code>Run_script</code>.</div>
+
+<div class="lane">
+  <div class="step">
+    <p class="eyebrow">Office 365 Outlook · Trigger <span class="tag keep">bestehend</span></p>
+    <h2>Bei Eingang einer neuen E-Mail (V3)</h2>
+    <dl class="fields">
+      <dt>Ordner</dt><dd>Posteingang (bzw. dein Avis-Ordner)</dd>
+      <dt>Nur mit Anlagen</dt><dd>Ja</dd>
+      <dt>Anlagen einschließen</dt><dd>Ja</dd>
+      <dt>Einstellungen</dt><dd>Parallelitätssteuerung ein, Grad = 1</dd>
+    </dl>
+  </div>
+  <div class="arrow"></div>
+  <div class="step cond">
+    <p class="eyebrow">Steuerung <span class="tag keep">bestehend</span></p>
+    <h2>Bedingung – keine automatisch erzeugte E-Mail</h2>
+    <dl class="fields"><dt>Prüfung</dt><dd>deine bestehende Prüfung (Absender / Auto-Reply-Kennzeichen), unverändert</dd></dl>
+  </div>
+  <div class="arrow"></div>
+  <div class="branches uneven">
+    <div class="scope">
+      <p class="label">Wahr</p>
+      <div class="lane">
+        <div class="scope loop">
+          <p class="label">Auf alle anwenden – Anlagen</p>
+          <div class="lane">
+            <div class="step">
+              <p class="eyebrow">Steuerung <span class="tag keep">bestehend</span></p>
+              <h2>Auf alle anwenden</h2>
+              <dl class="fields">
+                <dt>Ausgabe</dt><dd><code>triggerOutputs()?['body/attachments']</code></dd>
+                <dt>Einstellungen</dt><dd>Parallelitätssteuerung ein, Grad = 1 (Run script erlaubt 3 Aufrufe / 10 s)</dd>
+              </dl>
+            </div>
+            <div class="arrow"></div>
+            <div class="step">
+              <p class="eyebrow">Datenvorgang · Verfassen <span class="tag keep">bestehend</span></p>
+              <h2>Aktuelle Anlage prüfen</h2>
+              <dl class="fields"><dt>Eingabe</dt><dd>unverändert, z. B. <code>toLower(items('Apply_to_each')?['name'])</code></dd></dl>
+            </div>
+            <div class="arrow"></div>
+            <div class="step cond">
+              <p class="eyebrow">Steuerung <span class="tag keep">bestehend, erweitert</span></p>
+              <h2>Bedingung 1 – Anlage ist ein Avis-PDF</h2>
+              <dl class="fields">
+                <dt>Name enthält</dt><dd><code>contains(toLower(items('Apply_to_each')?['name']), 'avis')</code></dd>
+                <dt>und endet auf</dt><dd><code>endsWith(toLower(items('Apply_to_each')?['name']), '.pdf')</code></dd>
+                <dt>und kein Inline-Bild</dt><dd><code>equals(items('Apply_to_each')?['isInline'], false)</code></dd>
+                <dt>optional (oder)</dt><dd><code>contains(toLower(triggerOutputs()?['body/subject']), 'avis')</code></dd>
+              </dl>
+            </div>
+            <div class="arrow"></div>
+            <div class="branches uneven">
+              <div class="scope">
+                <p class="label">Wahr</p>
+                <div class="lane">
+                  <div class="step">
+                    <p class="eyebrow">Office 365 Outlook <span class="tag keep">bestehend</span></p>
+                    <h2>Anlage abrufen (V2)</h2>
+                    <dl class="fields">
+                      <dt>Nachrichten-ID</dt><dd><code>triggerOutputs()?['body/id']</code></dd>
+                      <dt>Anlagen-ID</dt><dd><code>items('Apply_to_each')?['id']</code></dd>
+                    </dl>
+                  </div>
+                  <div class="arrow"></div>
+                  <div class="step new">
+                    <p class="eyebrow">Excel Online (Business) <span class="tag new">neu</span></p>
+                    <h2>Skript ausführen</h2>
+                    <dl class="fields">
+                      <dt>Speicherort</dt><dd>OneDrive for Business</dd>
+                      <dt>Dokumentbibliothek</dt><dd>OneDrive</dd>
+                      <dt>Datei</dt><dd>AvisParser.xlsx (leere Arbeitsmappe)</dd>
+                      <dt>Skript</dt><dd>AvisPdfAmount</dd>
+                      <dt>pdfBase64</dt><dd><code>body('Get_attachment')?['contentBytes']</code> („Inhaltsbytes")</dd>
+                      <dt>extraKeywords</dt><dd>leer, bei Bedarf z. B. <code>Auszahlung, Überweisungssumme</code></dd>
+                    </dl>
+                  </div>
+                  <div class="arrow"></div>
+                  <div class="step">
+                    <p class="eyebrow">Datenvorgang · Verfassen <span class="tag keep">optional, Debug</span></p>
+                    <h2>Verfassen – Ergebnis anzeigen</h2>
+                    <dl class="fields"><dt>Eingabe</dt><dd><code>outputs('Run_script')?['body/result']</code> – zeigt im Verlauf Betrag, Methode, Kandidaten, Text</dd></dl>
+                  </div>
+                  <div class="arrow"></div>
+                  <div class="step cond new">
+                    <p class="eyebrow">Steuerung <span class="tag new">neu</span></p>
+                    <h2>Bedingung 2 – Betrag sicher erkannt</h2>
+                    <dl class="fields"><dt>Ausdruck ist wahr</dt><dd><code>and(equals(outputs('Run_script')?['body/result/ok'], true), not(equals(outputs('Run_script')?['body/result/confidence'], 'low')))</code></dd></dl>
+                  </div>
+                  <div class="arrow"></div>
+                  <div class="branches stack">
+                    <div class="scope">
+                      <p class="label">Wahr – Betrag erkannt</p>
+                      <div class="lane">
+                        <div class="step new">
+                          <p class="eyebrow">Office 365 Outlook <span class="tag new">neu</span></p>
+                          <h2>E-Mail senden (V2)</h2>
+                          <dl class="fields">
+                            <dt>An</dt><dd>deine Adresse</dd>
+                            <dt>Betreff</dt><dd><code>concat('WG: ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])</code></dd>
+                            <dt>Text (HTML)</dt><dd><pre>&lt;p&gt;&lt;b&gt;Von:&lt;/b&gt; @{triggerOutputs()?['body/from']}&lt;br&gt;
+&lt;b&gt;Empfangen:&lt;/b&gt; @{formatDateTime(triggerOutputs()?['body/receivedDateTime'], 'dd.MM.yyyy HH:mm')}&lt;br&gt;
+&lt;b&gt;Betreff:&lt;/b&gt; @{triggerOutputs()?['body/subject']}&lt;br&gt;
+&lt;b&gt;Betrag:&lt;/b&gt; @{outputs('Run_script')?['body/result/amount']} @{outputs('Run_script')?['body/result/currency']} (@{outputs('Run_script')?['body/result/method']})&lt;/p&gt;
+&lt;hr&gt;
+@{triggerOutputs()?['body/body']}</pre></dd>
+                            <dt>Anlage Name</dt><dd><code>items('Apply_to_each')?['name']</code></dd>
+                            <dt>Anlage Inhalt</dt><dd><code>body('Get_attachment')?['contentBytes']</code></dd>
+                          </dl>
+                        </div>
+                        <div class="arrow"></div>
+                        <div class="step new">
+                          <p class="eyebrow">Office 365 Outlook · HTTP-Anforderung senden <span class="tag new">neu</span></p>
+                          <h2>Rote Kategorie auf die Original-Mail</h2>
+                          <dl class="fields">
+                            <dt>URI</dt><dd><code>https://graph.microsoft.com/v1.0/me/messages/@{triggerOutputs()?['body/id']}</code></dd>
+                            <dt>Methode</dt><dd>PATCH</dd>
+                            <dt>Text</dt><dd><code>{ "categories": ["Rote Kategorie"] }</code></dd>
+                            <dt>Content-Type</dt><dd>application/json</dd>
+                          </dl>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="scope false">
+                      <p class="label">Falsch – nicht erkannt / unsicher</p>
+                      <div class="lane">
+                        <div class="step new">
+                          <p class="eyebrow">Office 365 Outlook <span class="tag new">neu</span></p>
+                          <h2>E-Mail senden (V2)</h2>
+                          <dl class="fields">
+                            <dt>An</dt><dd>deine Adresse</dd>
+                            <dt>Betreff</dt><dd><code>concat('WG: ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')</code></dd>
+                            <dt>Text (HTML)</dt><dd><pre>&lt;p&gt;&lt;b&gt;Grund:&lt;/b&gt; @{outputs('Run_script')?['body/result/error']}&lt;br&gt;
+&lt;b&gt;Sicherheit:&lt;/b&gt; @{outputs('Run_script')?['body/result/confidence']} (@{outputs('Run_script')?['body/result/method']})&lt;/p&gt;
+&lt;p&gt;&lt;b&gt;Kandidaten:&lt;/b&gt;&lt;br&gt;@{join(outputs('Run_script')?['body/result/candidates'], '&lt;br&gt;')}&lt;/p&gt;
+&lt;hr&gt;
+@{triggerOutputs()?['body/body']}</pre></dd>
+                            <dt>Anlage</dt><dd>wie im Wahr-Zweig (Name + Inhalt)</dd>
+                          </dl>
+                        </div>
+                        <div class="arrow"></div>
+                        <div class="step new">
+                          <p class="eyebrow">Office 365 Outlook · HTTP-Anforderung senden <span class="tag new">neu</span></p>
+                          <h2>Gelbe Kategorie auf die Original-Mail</h2>
+                          <dl class="fields">
+                            <dt>URI</dt><dd>wie oben</dd>
+                            <dt>Methode</dt><dd>PATCH</dd>
+                            <dt>Text</dt><dd><code>{ "categories": ["Gelbe Kategorie"] }</code></dd>
+                          </dl>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="scope false">
+                <p class="label">Falsch</p>
+                <p class="empty">0 Aktionen – Anlage ist kein Avis-PDF (Signaturbild, andere Datei).</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="scope false">
+      <p class="label">Falsch</p>
+      <p class="empty">0 Aktionen – automatisch erzeugte Mail wird ignoriert.</p>
+    </div>
+  </div>
+</div>
+
+<section class="setup">
+  <h2>Einmalige Einrichtung</h2>
+  <ol>
+    <li>Excel im Browser → Automatisieren → Neues Skript → Inhalt von <code>AvisPdfAmount.ts</code> einfügen → umbenennen in <code>AvisPdfAmount</code> → speichern (liegt dann in OneDrive/Dokumente/Office Scripts).</li>
+    <li>Leere Arbeitsmappe <code>AvisParser.xlsx</code> in OneDrive anlegen.</li>
+    <li>Kategorien „Rote Kategorie" und „Gelbe Kategorie" müssen in Outlook existieren (Standardnamen im deutschen Outlook).</li>
+    <li>Freigegebenes Postfach statt eigenem: in der HTTP-Anforderung <code>/users/postfach@firma.de/messages/…</code> statt <code>/me/messages/…</code>.</li>
+  </ol>
+  <p class="limits">Limits: Run script max. 1.600 Aufrufe pro Nutzer und Tag, 3 pro 10 s, 120 s Laufzeit, Parameter bis 28,6 MB. Verschlüsselte PDFs und Scans ohne Textschicht landen im Falsch-Zweig von Bedingung 2.</p>
+</section>
+</main>

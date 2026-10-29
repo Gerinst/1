@@ -1,0 +1,9 @@
+node_modules/
+dist/js/
+dist/*.png
+__pycache__/
+*.pyc
+.DS_Store
+# eigene (echte) Avis-PDFs niemals committen
+test/fixtures/real_*.pdf
+test/private/
