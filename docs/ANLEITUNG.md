@@ -35,14 +35,15 @@ Hast du den Flow schon nach einer früheren Fassung gebaut, reichen diese Punkte
 
 In jedem Feld, das du neu befüllst, zuerst den alten Inhalt entfernen: fx- oder Blitz-Bausteine über ihr **×**, im Feld **Text** in der Codeansicht **</>** mit Strg+A und Entf. Sonst hängt Power Automate alten und neuen Inhalt aneinander, und bei den Anlagen kommt eine unlesbare Datei an.
 
-1. **Neues Skript einfügen:** Excel im Browser, Reiter **Automatisieren**, **Alle Skripts** (bzw. **Skripts anzeigen**), **AvisPdfAmount** anklicken, **Bearbeiten**. Im Editor Strg+A, Entf, dann den Inhalt der neuen `AvisPdfAmount.ts` einfügen (wie Schritt 1 A, Punkt 5) und **Skript speichern**. Die Felder bleiben gleich, in Run_script musst du nichts neu auswählen.
-2. **Bedingung 2** neu fassen, damit signierte Avis-Mails durchkommen: Schritt 3. Hattest du die optionale Betreff-Variante (rechts fx `true`): vorher den Hinweis „Früher mit Betreff-Variante" am Ende von Schritt 3 lesen.
-3. **Run_script** bekommt eine Wiederholungsrichtlinie: Schritt 4, Punkte 8 und 9.
-4. **Betrag_erkannt** (und Skriptergebnis, falls vorhanden) läuft auch, wenn Run_script fehlschlägt: Schritt 6, Punkte 7 bis 10.
-5. **Mail_mit_Betrag:** neuer Betreff und neuer Text (Schritt 7, Punkte 5 und 6).
-6. **Mail_nicht_erkannt:** neuer Text und neue Anlagen-Formeln (Schritt 9 A, Punkte 5 und 6).
-7. **Speichern**, dann die Tests aus Schritt 10.
-8. Optional: den Tagescheck anlegen (Schritt 11).
+1. **Neues Skript einfügen:** Excel im Browser, Reiter **Automatisieren**, **Alle Skripts** (bzw. **Skripts anzeigen**), **AvisPdfAmount** anklicken, **Bearbeiten**. Im Editor Strg+A, Entf, dann den Inhalt der neuen `AvisPdfAmount.ts` einfügen (wie Schritt 1 A, Punkt 5) und **Skript speichern**. Die Felder bleiben gleich.
+2. **Run_script, Feld pdfBase64** umstellen: den Blitz-Baustein „Inhaltsbytes" über sein **×** entfernen, dann **fx** und `base64(body('Get_attachment')?['contentBytes'])` eingeben, **Hinzufügen** (Schritt 4, Punkt 4). Ohne diese Änderung übergibt Power Automate die PDF oft als Text statt als Base64. Die meisten PDFs sind dann nicht mehr lesbar, und es kommt die gelbe Mail mit „not a PDF (header missing, …)" oder „PDF arrived as text instead of Base64".
+3. **Bedingung 2** neu fassen, damit signierte Avis-Mails durchkommen: Schritt 3. Hattest du die optionale Betreff-Variante (rechts fx `true`): vorher den Hinweis „Früher mit Betreff-Variante" am Ende von Schritt 3 lesen.
+4. **Run_script** bekommt eine Wiederholungsrichtlinie: Schritt 4, Punkte 8 und 9.
+5. **Betrag_erkannt** (und Skriptergebnis, falls vorhanden) läuft auch, wenn Run_script fehlschlägt: Schritt 6, Punkte 7 bis 10.
+6. **Mail_mit_Betrag:** neuer Betreff und neuer Text (Schritt 7, Punkte 5 und 6).
+7. **Mail_nicht_erkannt:** neuer Text und neue Anlagen-Formeln (Schritt 9 A, Punkte 5 und 6).
+8. **Speichern**, dann die Tests aus Schritt 10.
+9. Optional: den Tagescheck anlegen (Schritt 11).
 
 ## Begriffe
 
@@ -200,7 +201,7 @@ Die neue Aktion kommt in den Wahr-Zweig der inneren Bedingung 2, direkt unter �
 | Dokumentbibliothek | OneDrive |
 | Datei | Ordnersymbol rechts anklicken, zu **AvisParser.xlsx** navigieren, anklicken |
 | Skript | Aus der Liste **AvisPdfAmount** wählen |
-| pdfBase64 | In das Feld klicken, **Blitz** (Dynamischer Inhalt) anklicken, bei „Get_attachment" den Eintrag **Inhaltsbytes** wählen |
+| pdfBase64 | In das Feld klicken, **fx** (Ausdruck) anklicken, `base64(body('Get_attachment')?['contentBytes'])` eingeben, **Hinzufügen**. Nicht den Blitz-Eintrag „Inhaltsbytes" nehmen (siehe Tipp unten) |
 | extraKeywords | leer lassen |
 
 5. Die Felder pdfBase64 und extraKeywords erscheinen erst, nachdem das Skript gewählt wurde (Power Automate liest sie aus dem Skript). Erscheinen sie nicht: Skript in Excel noch einmal speichern, dann hier das Skript neu auswählen.
@@ -209,7 +210,7 @@ Die neue Aktion kommt in den Wahr-Zweig der inneren Bedingung 2, direkt unter �
 8. **Wiederholungsrichtlinie:** Bei Run_script den Reiter **Einstellungen** öffnen. Unter **Wiederholungsrichtlinie** den Typ **Festes Intervall** wählen, **Anzahl** `3`, **Intervall** `PT1M` (eine Minute).
 9. **Speichern**.
 
-Tipp: Im Feld „Inhaltsbytes" steht die PDF als langer Text (Base64). Das ist richtig so, das Skript wandelt es selbst zurück. Bei signierten Mails steht dort die ganze signierte Nachricht, auch das liest das Skript.
+Tipp: Warum `base64(…)` um die Inhaltsbytes? Wählt man „Inhaltsbytes" direkt über den Blitz, gibt Power Automate die Anlage an das Skript oft als Text weiter statt als Base64. Dabei gehen bei den meisten PDFs Teile verloren. Mit `base64(…)` kommt die Anlage sicher als Text aus Base64-Zeichen an, das Skript wandelt sie selbst zurück (auch wenn Power Automate unterwegs einmal umwandelt). Bei signierten Mails steht dort die ganze signierte Nachricht, auch das liest das Skript.
 
 Warum die Wiederholung: Schlägt Run_script wegen einer kurzen Störung fehl (z. B. „BadGateway" oder 429 „Rate limit", weil gerade mehrere Avise kamen), versucht Power Automate es nach einer Minute noch einmal, höchstens dreimal. Klappt es dann immer noch nicht, kommt die gelbe Prüf-Mail mit dem Grund (Schritt 6 und 9).
 
@@ -401,8 +402,9 @@ Stimmen in der Pilotphase alle roten Mails, reicht danach ein Blick auf die Mail
 | Gelbe Mail, Grund „Skript nicht gelaufen (Skipped): …", Anhang `Anlage_fehlt.txt` | Schon Get_attachment ist fehlgeschlagen, die Anlage konnte nicht geholt werden | Original-Mail in Outlook öffnen, Betrag von Hand |
 | Lauf bricht bei Run_script ab (rotes X), keine gelbe Mail | „Ausführen nach" fehlt bei Betrag_erkannt oder Skriptergebnis | Schritt 6, Punkte 7 bis 10 |
 | Run_script: „BadGateway" oder „We couldn't find the script" | Skript nicht gespeichert oder falscher Name | In Excel prüfen, dass das Skript **AvisPdfAmount** heißt und gespeichert ist, dann in Run_script neu auswählen |
+| Gelbe Mail bei jedem Avis, Grund „not a PDF (header missing, …; input … starts '%PDF…')" oder „PDF arrived as text instead of Base64" | Power Automate gibt die PDF als Text weiter, weil im Feld pdfBase64 der Blitz-Eintrag „Inhaltsbytes" steht | In Run_script das Feld pdfBase64 auf fx `base64(body('Get_attachment')?['contentBytes'])` umstellen (Schritt 4, Punkt 4) |
 | Run_script: Felder pdfBase64 / extraKeywords fehlen | Skript wurde vor dem Speichern ausgewählt | Skript in Run_script einmal abwählen und neu wählen |
-| Run_script: „The request content size exceeds the limit" | PDF größer als ca. 20 MB | Kommt bei Avisen praktisch nie vor; die gelbe Mail kommt trotzdem (Grund „Skript nicht gelaufen") |
+| Run_script: „The request content size exceeds the limit" | PDF größer als ca. 15 MB | Kommt bei Avisen praktisch nie vor; die gelbe Mail kommt trotzdem (Grund „Skript nicht gelaufen") |
 | Run_script: 429 „Rate limit" | Mehrere Avise gleichzeitig | Parallelität bei Trigger und Schleife auf 1 prüfen (Schritt 2), Wiederholungsrichtlinie prüfen (Schritt 4) |
 | Betrag_erkannt geht immer nach Falsch | Skriptausgabe nicht gelesen | Grund in der gelben Mail mit Anhang B vergleichen. Steht dort nichts Passendes und in Skriptergebnis `ok: true` mit `confidence` high oder medium: Formel in Betrag_erkannt prüfen |
 | Signierte Avis-Mail: keine [Avis-Bot]-Mail, Bedingung 2 im Verlauf Falsch | Die einzige Anlage heißt `smime.p7m`, und im Betreff steht kein „avis" | So gewollt (Schritt 3): Ohne „avis" im Betreff ist nicht zu erkennen, dass die Mail ein Avis ist. Auch der Tagescheck sieht sie deshalb nicht. Betrag von Hand; kommt das bei einem Absender öfter vor, Schritt 3 erweitern lassen |
@@ -534,7 +536,7 @@ Jede Formel wird über das **fx**-Symbol eingefügt, dann **Hinzufügen**. Vorau
 | Alternative für Bedingung 2, Zeile 1, mit Betreff (Schritt 3, „Früher mit Betreff-Variante") | `and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))` |
 | Bedingung 2 (innere), Zeile 2, links | `items('Apply_to_each')?['isInline']` |
 | Bedingung 2 (innere), Zeile 2, rechts | `false` |
-| Run_script, pdfBase64 (Alternative zum Blitz) | `body('Get_attachment')?['contentBytes']` |
+| Run_script, pdfBase64 | `base64(body('Get_attachment')?['contentBytes'])` |
 | Run_script, Einstellungen, Wiederholungsrichtlinie | Festes Intervall, Anzahl `3`, Intervall `PT1M` |
 | Skriptergebnis, Eingaben | `outputs('Run_script')?['body/result']` |
 | Skriptergebnis und Betrag_erkannt, Einstellungen, Ausführen nach | alle vier Häkchen: ist erfolgreich, Timeout, wurde übersprungen, ist fehlgeschlagen |
@@ -583,8 +585,9 @@ Das Skript schreibt den Grund auf Englisch, damit er überall gleich lesbar ist.
 
 | Grund (englisch) | Bedeutung | Was tun |
 | --- | --- | --- |
-| `no PDF content passed` | Das Skript hat keine Datei bekommen | In Run_script das Feld pdfBase64 prüfen (Inhaltsbytes von Get_attachment) |
-| `not a PDF (header missing, …)` | Die Anlage ist keine PDF oder beschädigt, auch wenn sie so heißt | Anlage von Hand öffnen; Betrag von Hand |
+| `no PDF content passed` | Das Skript hat keine Datei bekommen | In Run_script das Feld pdfBase64 prüfen: fx `base64(body('Get_attachment')?['contentBytes'])` (Schritt 4, Punkt 4) |
+| `not a PDF (header missing, …)` | Die Anlage ist keine PDF oder beschädigt, auch wenn sie so heißt. In der Klammer stehen die Größe und die ersten Zeichen dessen, was beim Skript ankam: `starts 'JVBER…'` ist eine Base64-PDF, `starts '%PDF…'` eine PDF als Text | Anlage von Hand öffnen; Betrag von Hand. Kommt das bei jeder PDF: Feld pdfBase64 in Run_script prüfen (Schritt 4, Punkt 4) |
+| `PDF arrived as text instead of Base64 - content damaged (…)` | Power Automate hat die PDF als Text statt als Base64 übergeben, dabei sind Teile verloren gegangen. In der Klammer steht, woran das Lesen gescheitert ist | Betrag von Hand. In Run_script das Feld pdfBase64 auf fx `base64(body('Get_attachment')?['contentBytes'])` umstellen (Schritt 4, Punkt 4) |
 | `PDF is password protected - cannot be read` | Die PDF hat ein Kennwort zum Öffnen | Betrag von Hand (Kennwort beim Absender erfragen). PDFs, die nur gegen Kopieren oder Drucken geschützt sind, liest das Skript dagegen normal |
 | `PDF is encrypted with a certificate - cannot be read` | Die PDF ist mit einem Zertifikat verschlüsselt | Betrag von Hand |
 | `PDF is encrypted with an unsupported method (…) - cannot be read` | Die PDF ist mit einem Verfahren verschlüsselt, das das Skript nicht kennt | Betrag von Hand |
@@ -610,6 +613,7 @@ Nach `uncertain:` folgen ein oder mehrere dieser Gründe, getrennt durch `;`. De
 | Grund (englisch) | Bedeutung |
 | --- | --- |
 | `OCR text layer` | Der Text stammt aus einer Texterkennung (OCR) über einem Scan. Ziffern können falsch erkannt sein |
+| `PDF arrived as text instead of Base64 - parts may be damaged` | Power Automate hat die PDF als Text statt als Base64 übergeben. Ein Teil ließ sich lesen, andere Teile sind verloren. Den Vorschlag mit der PDF vergleichen und das Feld pdfBase64 in Run_script auf fx `base64(body('Get_attachment')?['contentBytes'])` umstellen (Schritt 4, Punkt 4) |
 | `PDF read incompletely (…)` | Die PDF konnte nur teilweise gelesen werden (beschädigt, abgeschnitten, Zeichen ohne Zuordnung). Der richtige Betrag kann fehlen |
 | `PDF read incompletely (time budget exhausted)` | Die PDF war so groß oder aufwendig, dass das Zeitlimit von 90 Sekunden erreicht wurde |
 | `PDF changed after signing` | Die PDF selbst ist digital signiert und wurde nach der letzten Signatur noch verändert. Der gelesene Betrag ist vielleicht nicht der signierte. Im Zweifel beim Absender nachfragen |
@@ -665,6 +669,7 @@ Nach `uncertain:` folgen ein oder mehrere dieser Gründe, getrennt durch `;`. De
 | `from signed mail: …` | Der Betrag stammt aus dieser PDF in der signierten Mail (`from mail: …` bei einer weitergeleiteten Mail-Datei) |
 | `… PDFs checked (…)` / `only … of … PDFs checked` | Die Mail enthielt mehrere PDFs, das Skript hat die genannten geprüft und die beste genommen. Hat eine PDF „Zahlungsavis" oder „Avis" als eigenes Wort im Namen (nicht „Lieferavis"), prüft es nur diese |
 | `only the first 50 of … PDFs read` | Die Mail enthielt mehr als 50 PDFs. Das Skript hat nur die ersten 50 angesehen |
+| `PDF arrived as text instead of Base64` | Power Automate hat die PDF als Text übergeben, sie ließ sich aber vollständig zurückwandeln. Der Betrag stimmt; trotzdem das Feld pdfBase64 in Run_script auf fx `base64(body('Get_attachment')?['contentBytes'])` umstellen (Schritt 4, Punkt 4), sonst gehen bei anderen PDFs Teile verloren |
 | `decrypted (permissions-only encryption)` | Die PDF war nur gegen Kopieren oder Drucken geschützt und wurde normal gelesen |
 | `OCR text layer (… % of the text)` | Text aus Texterkennung. In einer roten Mail kommt das nicht vor, solche Avise gehen immer in die Prüfung |
 | `incomplete: …` | PDF teilweise gelesen. Kommt in roten Mails ebenfalls nicht vor |

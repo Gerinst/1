@@ -36,12 +36,95 @@ const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345
 
 function base64ToBytes(input: string): Uint8Array {
   let s = input;
-  // tolerate a JSON file object {"$content-type":"...","$content":"..."} or a data URI
-  const m = /"\$content"\s*:\s*"([^"]*)"/.exec(s);
+  // tolerate a JSON file object {"$content-type":"...","$content":"..."} (also JSON-escaped) or a data URI
+  const m = /"\$content"\s*:\s*"([^"]*)"/.exec(s) || /\\"\$content\\"\s*:\s*\\"((?:[^"\\]|\\\/)*)\\"/.exec(s);
   if (m) s = m[1];
   const comma = s.indexOf(",");
   if (s.substring(0, 5) === "data:" && comma > 0) s = s.substring(comma + 1);
   return decodeBase64Range(s, 0, s.length);
+}
+
+// Windows-1252 code points of the bytes 0x80-0x9F (0 = byte not defined in Windows-1252)
+const CP1252_HIGH = [0x20ac, 0, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017d, 0,
+  0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0, 0x017e, 0x0178];
+// start of a mail header block (raw .eml / clear-signed smime.p7m passed as text)
+const MAIL_HEAD_TEXT = /^\s*(?:mime-version|content-type|received|return-path|from|date|message-id|subject)\s*:/i;
+
+// How the file arrived: form "base64" (normal), "base64x2" (Base64 of the Base64 text, e.g. base64(contentBytes)),
+// "text" (the flow passed the file as text); damaged = characters that could not be turned back into bytes (U+FFFD)
+interface InputBytes { bytes: Uint8Array; form: string; damaged: number }
+
+function decodeInput(input: string): InputBytes {
+  // Base64 is printable ASCII without '%' or ':', so "%PDF-", a mail header or a control / non-ASCII character
+  // near the start means the file came as text (a leading byte-order mark is ignored)
+  const src = input.charCodeAt(0) === 0xfeff ? input.substring(1) : input;
+  const head = src.substring(0, 2048);
+  if (head.indexOf("%PDF-") >= 0 || MAIL_HEAD_TEXT.test(head) || /[^\t\n\r\x20-\x7e]/.test(head.substring(0, 256))) return textToBytes(src);
+  const bytes = base64ToBytes(src);
+  if (bytes.length >= 16 && isBase64Text(bytes)) {
+    const inner = decodeBase64Range(bytesToLatin1(bytes, 0, bytes.length), 0, bytes.length);
+    const innerHead = bytesToLatin1(inner, 0, Math.min(inner.length, 2048));
+    if (inner.length >= 8 && (innerHead.indexOf("%PDF") >= 0 || MAIL_HEAD_TEXT.test(innerHead) || inner[0] === 0x30)) {
+      return { bytes: inner, form: "base64x2", damaged: 0 };
+    }
+  }
+  return { bytes: bytes, form: "base64", damaged: 0 };
+}
+
+function isBase64Text(b: Uint8Array): boolean {
+  // the first bytes are Base64 digits only (a PDF starts with "%PDF", a mail with "Name:", CMS with 0x30)
+  const n = Math.min(b.length, 256);
+  let digits = 0;
+  for (let i = 0; i < n; i++) {
+    const c = b[i];
+    const digit = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2f || c === 0x2d || c === 0x5f;
+    if (digit) digits++;
+    else if (c !== 0x3d && c !== 0x0d && c !== 0x0a && c !== 0x20 && c !== 0x09) return false;
+  }
+  return digits >= 16;
+}
+
+function textToBytes(s: string): InputBytes {
+  // undo the text decoding of a file: Latin-1 / Windows-1252 text maps back byte for byte;
+  // UTF-8 text is encoded again, but bytes that were not valid UTF-8 became U+FFFD and are lost
+  let utf8 = false, damaged = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0xfffd) damaged++;
+    else if (c > 0xff && CP1252_HIGH.indexOf(c) < 0) utf8 = true;
+  }
+  if (damaged > 0) utf8 = true;
+  const out = new Uint8Array(utf8 ? s.length * 3 : s.length);
+  let o = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (!utf8) {
+      const k = c > 0xff ? CP1252_HIGH.indexOf(c) : -1;
+      out[o++] = c <= 0xff ? c : k >= 0 ? 0x80 + k : 0x3f;
+    } else if (c < 0x80) out[o++] = c;
+    else if (c === 0xfffd) out[o++] = 0x3f; // a lost byte
+    else if (c < 0x800) {
+      out[o++] = 0xc0 | (c >> 6);
+      out[o++] = 0x80 | (c & 0x3f);
+    } else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      const cp = 0x10000 + ((c - 0xd800) << 10) + (s.charCodeAt(i + 1) - 0xdc00);
+      i++;
+      out[o++] = 0xf0 | (cp >> 18);
+      out[o++] = 0x80 | ((cp >> 12) & 0x3f);
+      out[o++] = 0x80 | ((cp >> 6) & 0x3f);
+      out[o++] = 0x80 | (cp & 0x3f);
+    } else {
+      out[o++] = 0xe0 | (c >> 12);
+      out[o++] = 0x80 | ((c >> 6) & 0x3f);
+      out[o++] = 0x80 | (c & 0x3f);
+    }
+  }
+  return { bytes: out.subarray(0, o), form: "text", damaged: damaged };
+}
+
+function describeInput(s: string): string {
+  // length and first characters of the script input, for the error text (no file content beyond the header)
+  return s.length + " chars, starts '" + s.substring(0, 12).replace(/[^\x20-\x7e]/g, "?").replace(/'/g, "?") + "'";
 }
 
 function decodeBase64Range(s: string, start: number, end: number): Uint8Array {
@@ -5520,19 +5603,39 @@ function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?:
   runDeadline = Date.now() + 90000; // stay well below the 120 s Power Automate limit
   try {
     if (!pdfBase64 || pdfBase64.length < 16) { res.error = "no PDF content passed"; return res; }
-    const bytes = base64ToBytes(pdfBase64);
+    const inp = decodeInput(pdfBase64);
+    const bytes = inp.bytes;
     if (bytes.length < 8 || bytesToLatin1(bytes, 0, 4) !== "%PDF") {
       // not a PDF: a mail container (smime.p7m: clear-signed MIME text or CMS SignedData; encrypted S/MIME; .rpmsg)?
       const mail = unwrapMail(bytes);
-      if (mail.container) return mailResult(mail, bytes.length, extraKeywords || "");
+      if (mail.container) return inputNote(mailResult(mail, bytes.length, extraKeywords || ""), inp);
       totalDecoded = 0;
       // some mail systems prefix junk before %PDF – look for the header anyway
       const probe = bytesToLatin1(bytes, 0, Math.min(bytes.length, 2048));
-      if (probe.indexOf("%PDF") < 0) { res.error = "not a PDF (header missing, " + bytes.length + " bytes)"; return res; }
+      if (probe.indexOf("%PDF") < 0) {
+        res.error = "not a PDF (header missing, " + bytes.length + " bytes; input " + describeInput(pdfBase64) + ")";
+        return res;
+      }
     }
-    return analyzePdf(bytes, extraKeywords || "").res;
+    return inputNote(analyzePdf(bytes, extraKeywords || "").res, inp);
   } catch (e) {
     res.error = "exception: " + String(e);
     return res;
   }
+}
+
+function inputNote(res: AvisResult, inp: InputBytes): AvisResult {
+  // the flow passed the file as text instead of Base64: say so; with lost bytes the amount is never trusted
+  if (inp.form !== "text") return res;
+  res.warnings = "PDF arrived as text instead of Base64" + (inp.damaged > 0 ? " (" + inp.damaged + " characters lost)" : "")
+    + (res.warnings !== "" ? " | " + res.warnings : "");
+  if (inp.damaged === 0) return res;
+  if (res.ok) {
+    const prev = res.error.indexOf("uncertain: ") === 0 ? res.error.substring(11) : res.error;
+    res.confidence = "low";
+    res.error = "uncertain: PDF arrived as text instead of Base64 - parts may be damaged" + (prev !== "" ? "; " + prev : "");
+  } else {
+    res.error = "PDF arrived as text instead of Base64 - content damaged (" + res.error + ")";
+  }
+  return res;
 }
