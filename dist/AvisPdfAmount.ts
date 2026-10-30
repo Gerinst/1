@@ -84,12 +84,17 @@ function latin1ToBytes(s: string): Uint8Array {
 // Inflate (zlib / raw deflate) – lenient: returns what could be decoded
 // ---------------------------------------------------------------------
 class BitReader {
+  data: Uint8Array;
   pos: number;
-  bitBuf = 0;
-  bitCnt = 0;
-  eof = false;
-  constructor(public data: Uint8Array, pos: number) {
+  bitBuf: number;
+  bitCnt: number;
+  eof: boolean;
+  constructor(data: Uint8Array, pos: number) {
+    this.data = data;
     this.pos = pos;
+    this.bitBuf = 0;
+    this.bitCnt = 0;
+    this.eof = false;
   }
   bits(n: number): number {
     let val = this.bitBuf;
@@ -152,12 +157,14 @@ let FIXED_DIST: Huffman | null = null;
 const MAX_STREAM_BYTES = 64 * 1024 * 1024;   // decoded size of a single stream
 const MAX_TOTAL_DECODED = 256 * 1024 * 1024; // decoded size of all streams together
 let totalDecoded = 0;
+let runDeadline = 0; // Date.now() value after which decoding and interpretation stop (set in main)
 
 class ByteSink {
   buf: Uint8Array;
-  len = 0;
+  len: number;
   constructor(cap: number) {
     this.buf = new Uint8Array(Math.min(Math.max(cap, 1024), MAX_STREAM_BYTES));
+    this.len = 0;
   }
   ensure(extra: number): void {
     if (this.len + extra > this.buf.length) {
@@ -185,7 +192,8 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
   const br = new BitReader(data, pos);
   const out = new ByteSink(data.length * 4);
   let last = 0;
-  outer: while (!last) {
+  let broken = false;
+  while (!last && !broken) {
     last = br.bits(1);
     const type = br.bits(2);
     if (last < 0 || type < 0) break;
@@ -198,7 +206,7 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
       br.pos += 4;
       out.ensure(len);
       for (let i = 0; i < len; i++) {
-        if (br.pos >= data.length) break outer;
+        if (br.pos >= data.length) { broken = true; break; }
         out.buf[out.len++] = data[br.pos++];
       }
       continue;
@@ -232,13 +240,13 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
       const ll = new Uint8Array(320);
       while (idx < nlen + ndist) {
         let sym = huffDecode(br, lencode);
-        if (sym < 0) break outer;
+        if (sym < 0) { broken = true; break; }
         if (sym < 16) {
           ll[idx++] = sym;
         } else {
           let len = 0, rep = 0;
           if (sym === 16) {
-            if (idx === 0) break outer;
+            if (idx === 0) { broken = true; break; }
             len = ll[idx - 1];
             rep = 3 + br.bits(2);
           } else if (sym === 17) {
@@ -246,11 +254,11 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
           } else {
             rep = 11 + br.bits(7);
           }
-          if (idx + rep > nlen + ndist) break outer;
+          if (idx + rep > nlen + ndist) { broken = true; break; }
           while (rep-- > 0) ll[idx++] = len;
         }
       }
-      if (br.eof) break;
+      if (broken || br.eof) break;
       lit = huffBuild(ll.subarray(0, nlen), nlen);
       dist = huffBuild(ll.subarray(nlen, nlen + ndist), ndist);
     } else {
@@ -259,23 +267,23 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
     // decode compressed block
     for (;;) {
       let sym = huffDecode(br, lit);
-      if (sym < 0) break outer;
+      if (sym < 0) { broken = true; break; }
       if (sym < 256) {
         out.push(sym);
       } else if (sym === 256) {
         break;
       } else {
         sym -= 257;
-        if (sym >= 29) break outer;
+        if (sym >= 29) { broken = true; break; }
         const eb = br.bits(LEN_EXTRA[sym]);
-        if (eb < 0) break outer;
+        if (eb < 0) { broken = true; break; }
         const len = LEN_BASE[sym] + eb;
         const ds = huffDecode(br, dist);
-        if (ds < 0 || ds >= 30) break outer;
+        if (ds < 0 || ds >= 30) { broken = true; break; }
         const de = br.bits(DIST_EXTRA[ds]);
-        if (de < 0) break outer;
+        if (de < 0) { broken = true; break; }
         const d = DIST_BASE[ds] + de;
-        if (d > out.len) break outer;
+        if (d > out.len) { broken = true; break; }
         out.ensure(len);
         let src = out.len - d;
         for (let i = 0; i < len; i++) out.buf[out.len++] = out.buf[src++];
@@ -658,8 +666,10 @@ function isRegular(c: number): boolean {
 // Lexer / parser over a latin1 string
 // ---------------------------------------------------------------------
 class Lexer {
-  pos = 0;
-  constructor(public s: string, pos: number) {
+  s: string;
+  pos: number;
+  constructor(s: string, pos: number) {
+    this.s = s;
     this.pos = pos;
   }
   skipWs(): void {
@@ -684,8 +694,8 @@ class Lexer {
     while (this.pos < this.s.length && isRegular(this.s.charCodeAt(this.pos))) this.pos++;
     return this.s.substring(start, this.pos);
   }
-  /** Parses one object. Keywords are returned as PKw. Returns null at EOF. */
   parse(depth: number): PObj | null {
+    // Parses one object. Keywords are returned as PKw. Returns null at EOF.
     this.skipWs();
     const s = this.s;
     if (this.pos >= s.length) return null;
@@ -846,14 +856,28 @@ class Lexer {
 interface ObjEntry { obj: PObj; pos: number }
 
 class PdfDoc {
-  objs = new Map<number, ObjEntry>();
-  streamCache = new Map<number, Uint8Array>();
-  trailerRoot: PRef | null = null;
-  encrypted = false;
-  warnings: string[] = [];
-  nextStreamId = 1;
+  s: string;
+  objs: Map<number, ObjEntry>;
+  streamCache: Map<number, Uint8Array>;
+  failedStreams: Set<number>;
+  trailerRoot: PRef | null;
+  encrypted: boolean;
+  warnings: string[];
+  nextStreamId: number;
 
-  constructor(public s: string) {
+  constructor(s: string) {
+    this.s = s;
+    this.objs = new Map<number, ObjEntry>();
+    this.streamCache = new Map<number, Uint8Array>();
+    this.failedStreams = new Set<number>();
+    this.trailerRoot = null;
+    this.encrypted = false;
+    this.warnings = [];
+    this.nextStreamId = 1;
+  }
+
+  load(): void {
+    // two-phase init keeps the constructor free of heavy work (Office Scripts restriction)
     this.scan();
     this.expandObjectStreams();
   }
@@ -865,6 +889,7 @@ class PdfDoc {
     let guard = 0;
     while ((m = re.exec(s)) !== null) {
       if (++guard > 500000) break;
+      if ((guard & 4095) === 0 && Date.now() > runDeadline) { this.warnings.push("time budget exhausted while scanning objects"); break; }
       const num = parseInt(m[1], 10);
       const start = m.index;
       let after = start + m[0].length;
@@ -902,7 +927,7 @@ class PdfDoc {
       } catch (e) { /* ignore */ }
     }
     // cross-reference streams carry the trailer entries too
-    this.objs.forEach((e: ObjEntry) => {
+    for (const e of Array.from(this.objs.values())) {
       if (isStream(e.obj)) {
         const ty = e.obj.d.m.get("Type");
         if (ty !== undefined && isName(ty) && ty.v === "XRef") {
@@ -911,7 +936,7 @@ class PdfDoc {
           if (root !== undefined && isRef(root) && e.pos > lastTrailerPos) { this.trailerRoot = root; lastTrailerPos = e.pos; }
         }
       }
-    });
+    }
   }
 
   private readStream(d: PDict, p: number): { stream: PStream; end: number } {
@@ -949,12 +974,12 @@ class PdfDoc {
 
   private expandObjectStreams(): void {
     const stms: { entry: ObjEntry; num: number }[] = [];
-    this.objs.forEach((e: ObjEntry, num: number) => {
+    for (const [num, e] of Array.from(this.objs.entries())) {
       if (isStream(e.obj)) {
         const ty = e.obj.d.m.get("Type");
         if (ty !== undefined && isName(ty) && ty.v === "ObjStm") stms.push({ entry: e, num: num });
       }
-    });
+    }
     stms.sort((a, b) => a.entry.pos - b.entry.pos);
     for (const st of stms) {
       try {
@@ -986,8 +1011,8 @@ class PdfDoc {
     }
   }
 
-  // --- object access ---
   resolve(o: PObj | undefined): PObj {
+    // object access
     let cur: PObj = o === undefined ? null : o;
     for (let i = 0; i < 32 && isRef(cur); i++) {
       const e = this.objs.get(cur.n);
@@ -1017,11 +1042,20 @@ class PdfDoc {
     const r = this.resolve(o);
     return isArr(r) ? r.v : [];
   }
+  numArr(o: PObj | undefined, def: number): number[] {
+    // numbers of an array object (plain loop, no Array callback)
+    const out: number[] = [];
+    for (const v of this.arrOf(o)) out.push(this.num(v, def));
+    return out;
+  }
 
-  // --- stream decoding ---
   streamData(st: PStream): Uint8Array {
+    // stream decoding
     const cached = this.streamCache.get(st.id);
     if (cached !== undefined) return cached;
+    if (this.failedStreams.has(st.id)) throw new Error("stream could not be decoded (see its first warning)");
+    if (Date.now() > runDeadline) throw new Error("time budget exhausted");
+    this.failedStreams.add(st.id); // removed again below on success: a broken or oversized stream is decoded only once
     let data = latin1ToBytes(st.raw);
     const filters: string[] = [];
     const f = this.resolve(st.d.m.get("Filter"));
@@ -1053,6 +1087,7 @@ class PdfDoc {
         break;
       }
     }
+    this.failedStreams.delete(st.id);
     this.streamCache.set(st.id, data);
     return data;
   }
@@ -1067,35 +1102,20 @@ class PdfDoc {
     return bytesToLatin1(d, 0, d.length);
   }
 
-  // --- page tree ---
   pages(): { dict: PDict; resources: PDict | null }[] {
+    // page tree
     const out: { dict: PDict; resources: PDict | null }[] = [];
     const seen = new Set<PDict>();
     let root: PDict | null = this.trailerRoot ? this.dictOf(this.trailerRoot) : null;
     if (!root) root = this.findCatalog();
     const pagesRoot = root ? this.dictOf(root.m.get("Pages")) : null;
-    const walk = (node: PDict, inherited: PDict | null, depth: number): void => {
-      if (depth > 64 || seen.has(node)) return;
-      seen.add(node);
-      const res = this.dictOf(node.m.get("Resources")) || inherited;
-      const type = this.nameOf(node.m.get("Type"));
-      const kids = this.arrOf(node.m.get("Kids"));
-      if (type === "Page" || (kids.length === 0 && node.m.has("Contents"))) {
-        out.push({ dict: node, resources: res });
-        return;
-      }
-      for (const k of kids) {
-        const kd = this.dictOf(k);
-        if (kd) walk(kd, res, depth + 1);
-      }
-    };
-    if (pagesRoot) walk(pagesRoot, null, 0);
+    if (pagesRoot) this.walkPages(pagesRoot, null, 0, out, seen);
     if (out.length === 0) {
       // fallback: every /Type /Page object in file order
       const found: { d: PDict; pos: number }[] = [];
-      this.objs.forEach((e: ObjEntry) => {
+      for (const e of Array.from(this.objs.values())) {
         if (isDict(e.obj) && this.nameOf(e.obj.m.get("Type")) === "Page") found.push({ d: e.obj, pos: e.pos });
-      });
+      }
       found.sort((a, b) => a.pos - b.pos);
       for (const f of found) {
         let res = this.dictOf(f.d.m.get("Resources"));
@@ -1110,11 +1130,27 @@ class PdfDoc {
     return out;
   }
 
+  private walkPages(node: PDict, inherited: PDict | null, depth: number, out: { dict: PDict; resources: PDict | null }[], seen: Set<PDict>): void {
+    if (depth > 64 || seen.has(node)) return;
+    seen.add(node);
+    const res = this.dictOf(node.m.get("Resources")) || inherited;
+    const type = this.nameOf(node.m.get("Type"));
+    const kids = this.arrOf(node.m.get("Kids"));
+    if (type === "Page" || (kids.length === 0 && node.m.has("Contents"))) {
+      out.push({ dict: node, resources: res });
+      return;
+    }
+    for (const k of kids) {
+      const kd = this.dictOf(k);
+      if (kd) this.walkPages(kd, res, depth + 1, out, seen);
+    }
+  }
+
   private findCatalog(): PDict | null {
     let found: PDict | null = null;
-    this.objs.forEach((e: ObjEntry) => {
+    for (const e of Array.from(this.objs.values())) {
       if (found === null && isDict(e.obj) && this.nameOf(e.obj.m.get("Type")) === "Catalog") found = e.obj;
-    });
+    }
     return found;
   }
 
@@ -1297,8 +1333,7 @@ function parseTrueTypeCmap(data: Uint8Array): TtMaps | null {
     const t = bytesToLatin1(data, rec, rec + 4);
     if (t === "cmap") { cmapOff = u32(rec + 8); cmapLen = u32(rec + 12); }
   }
-  if (cmapOff < 0 || cmapOff + 4 > data.length) return null;
-  void cmapLen;
+  if (cmapOff < 0 || cmapOff + 4 > data.length || cmapLen < 4) return null;
   const maps: TtMaps = { gidToUni: new Map<number, string>(), codeToGid: new Map<number, number>(), hasUni: false };
   const n = u16(cmapOff + 2);
   const addUni = (cp: number, gid: number): void => {
@@ -1382,9 +1417,14 @@ interface FontInfo {
 interface Glyph { code: number; u: string; w: number; isSpace: boolean }
 
 class FontLoader {
-  cache = new Map<PDict, FontInfo>();
-  fallbackFont: FontInfo | null = null;
-  constructor(public doc: PdfDoc) {}
+  doc: PdfDoc;
+  cache: Map<PDict, FontInfo>;
+  fallbackFont: FontInfo | null;
+  constructor(doc: PdfDoc) {
+    this.doc = doc;
+    this.cache = new Map<PDict, FontInfo>();
+    this.fallbackFont = null;
+  }
 
   load(fontObj: PObj | undefined): FontInfo | null {
     const d = this.doc.dictOf(fontObj);
@@ -1397,8 +1437,8 @@ class FontLoader {
     return f;
   }
 
-  /** Helvetica/WinAnsi stand-in for missing font resources */
   fallback(): FontInfo {
+    // Helvetica/WinAnsi stand-in for missing font resources
     if (!this.fallbackFont) {
       const d = mkDict();
       d.m.set("BaseFont", mkName("Helvetica"));
@@ -1490,8 +1530,8 @@ class FontLoader {
       }
       // widths
       if (f.type3) {
-        const fm = doc.arrOf(d.m.get("FontMatrix"));
-        if (fm.length === 6) f.fontMatrix = fm.map((v: PObj) => doc.num(v, 0));
+        const fm = doc.numArr(d.m.get("FontMatrix"), 0);
+        if (fm.length === 6) f.fontMatrix = fm;
       }
       const firstChar = doc.num(d.m.get("FirstChar"), 0);
       const widths = doc.arrOf(d.m.get("Widths"));
@@ -1545,8 +1585,8 @@ class FontLoader {
     return w !== undefined ? w : f.defaultWidth;
   }
 
-  /** Splits a PDF string into glyphs (code, unicode, width/1000). */
   decode(f: FontInfo, s: string): Glyph[] {
+    // Splits a PDF string into glyphs (code, unicode, width/1000).
     const out: Glyph[] = [];
     if (!f.composite) {
       for (let i = 0; i < s.length; i++) {
@@ -1620,14 +1660,20 @@ function matMul(m1: Mat, m2: Mat): Mat {
 interface GState { ctm: Mat; font: FontInfo | null; size: number; charSp: number; wordSp: number; hscale: number; leading: number; rise: number }
 
 class ContentInterpreter {
-  items: TextItem[] = [];
+  doc: PdfDoc;
+  items: TextItem[];
   fonts: FontLoader;
-  formDepth = 0;
-  ops = 0;
-  deadline = Date.now() + 90000; // stay well below the 120 s Power Automate limit
+  formDepth: number;
+  ops: number;
+  deadline: number;
 
-  constructor(public doc: PdfDoc) {
+  constructor(doc: PdfDoc) {
+    this.doc = doc;
+    this.items = [];
     this.fonts = new FontLoader(doc);
+    this.formDepth = 0;
+    this.ops = 0;
+    this.deadline = runDeadline; // one budget for the whole run, set in main
   }
 
   runPage(content: string, resources: PDict | null, page: number): void {
@@ -1635,8 +1681,8 @@ class ContentInterpreter {
     this.run(content, resources, gs, page, new Set<number>());
   }
 
-  /** Text inside form-field / annotation appearance streams (filled AcroForms, stamps) */
   runAnnotations(pageDict: PDict, resources: PDict | null, page: number): void {
+    // Text inside form-field / annotation appearance streams (filled AcroForms, stamps)
     const doc = this.doc;
     const annots = doc.arrOf(pageDict.m.get("Annots"));
     for (const a of annots) {
@@ -1651,14 +1697,14 @@ class ContentInterpreter {
       let n = doc.resolve(ap.m.get("N"));
       if (isDict(n)) { // appearance sub-dictionary keyed by state
         const as = doc.nameOf(ad.m.get("AS"));
-        const pick = as !== "" ? n.m.get(as) : (n.m.size > 0 ? n.m.values().next().value : undefined);
+        const pick: PObj | undefined = as !== "" ? n.m.get(as) : (n.m.size > 0 ? n.m.values().next().value : undefined);
         n = doc.resolve(pick);
       }
       if (!isStream(n)) continue;
-      const rect = doc.arrOf(ad.m.get("Rect")).map((v: PObj) => doc.num(v, 0));
-      const bbox = doc.arrOf(n.d.m.get("BBox")).map((v: PObj) => doc.num(v, 0));
+      const rect = doc.numArr(ad.m.get("Rect"), 0);
+      const bbox = doc.numArr(n.d.m.get("BBox"), 0);
       let ctm: Mat = [1, 0, 0, 1, 0, 0];
-      const mtx = doc.arrOf(n.d.m.get("Matrix")).map((v: PObj) => doc.num(v, 0));
+      const mtx = doc.numArr(n.d.m.get("Matrix"), 0);
       if (mtx.length === 6) ctm = [mtx[0], mtx[1], mtx[2], mtx[3], mtx[4], mtx[5]];
       if (rect.length === 4 && bbox.length === 4) {
         // map transformed BBox onto Rect (PDF 12.5.5 algorithm, simplified: translate + scale)
@@ -1675,6 +1721,35 @@ class ContentInterpreter {
     }
   }
 
+  private showText(gs: GState, tm: Mat, str: string, page: number): Mat {
+    // returns the text matrix advanced past the shown string
+    const f = gs.font;
+    if (!f) {
+      // no font selected: still advance roughly so following text is placed sensibly
+      return matMul([1, 0, 0, 1, str.length * 0.5 * gs.size * gs.hscale, 0], tm);
+    }
+    const glyphs = this.fonts.decode(f, str);
+    const trm: Mat = matMul(matMul([gs.size * gs.hscale, 0, 0, gs.size, 0, gs.rise], tm), gs.ctm);
+    const scale = Math.sqrt(trm[0] * trm[0] + trm[1] * trm[1]) / Math.max(gs.size * gs.hscale, 1e-9);
+    let text = "";
+    let advance = 0; // text space units (before hscale)
+    for (const g of glyphs) {
+      const w0 = f.type3 ? g.w / 1000 : g.w / 1000;
+      let tx = w0 * gs.size + gs.charSp;
+      if (g.isSpace) tx += gs.wordSp;
+      advance += tx;
+      text += g.u;
+    }
+    const devW = advance * gs.hscale * scale;
+    const devH = Math.abs(gs.size * Math.sqrt(trm[2] * trm[2] + trm[3] * trm[3]) / Math.max(gs.size, 1e-9));
+    if (text.length > 0) {
+      let rot = Math.round(Math.atan2(trm[1], trm[0]) / (Math.PI / 2)) % 4;
+      if (rot < 0) rot += 4;
+      this.items.push({ x: trm[4], y: trm[5], w: devW, h: devH > 0 ? devH : Math.abs(gs.size * scale), s: text, sp: (f.spaceWidth / 1000) * gs.size * gs.hscale * scale, page: page, flip: trm[3] < 0, rot: rot });
+    }
+    return matMul([1, 0, 0, 1, advance * gs.hscale, 0], tm);
+  }
+
   private run(content: string, resources: PDict | null, gsIn: GState, page: number, visited: Set<number>): void {
     const doc = this.doc;
     const lx = new Lexer(content, 0);
@@ -1685,35 +1760,6 @@ class ContentInterpreter {
     let tlm: Mat = [1, 0, 0, 1, 0, 0];
     const fontDict = resources ? doc.dictOf(resources.m.get("Font")) : null;
     const xobjDict = resources ? doc.dictOf(resources.m.get("XObject")) : null;
-
-    const showText = (str: string): void => {
-      const f = gs.font;
-      if (!f) {
-        // no font selected: still advance roughly so following text is placed sensibly
-        tm = matMul([1, 0, 0, 1, str.length * 0.5 * gs.size * gs.hscale, 0], tm);
-        return;
-      }
-      const glyphs = this.fonts.decode(f, str);
-      const trm: Mat = matMul(matMul([gs.size * gs.hscale, 0, 0, gs.size, 0, gs.rise], tm), gs.ctm);
-      const scale = Math.sqrt(trm[0] * trm[0] + trm[1] * trm[1]) / Math.max(gs.size * gs.hscale, 1e-9);
-      let text = "";
-      let advance = 0; // text space units (before hscale)
-      for (const g of glyphs) {
-        const w0 = f.type3 ? g.w / 1000 : g.w / 1000;
-        let tx = w0 * gs.size + gs.charSp;
-        if (g.isSpace) tx += gs.wordSp;
-        advance += tx;
-        text += g.u;
-      }
-      const devW = advance * gs.hscale * scale;
-      const devH = Math.abs(gs.size * Math.sqrt(trm[2] * trm[2] + trm[3] * trm[3]) / Math.max(gs.size, 1e-9));
-      if (text.length > 0) {
-        let rot = Math.round(Math.atan2(trm[1], trm[0]) / (Math.PI / 2)) % 4;
-        if (rot < 0) rot += 4;
-        this.items.push({ x: trm[4], y: trm[5], w: devW, h: devH > 0 ? devH : Math.abs(gs.size * scale), s: text, sp: (f.spaceWidth / 1000) * gs.size * gs.hscale * scale, page: page, flip: trm[3] < 0, rot: rot });
-      }
-      tm = matMul([1, 0, 0, 1, advance * gs.hscale, 0], tm);
-    };
 
     let guard = 0;
     for (;;) {
@@ -1750,14 +1796,14 @@ class ContentInterpreter {
         case "Tw": gs.wordSp = n(1); break;
         case "Tz": gs.hscale = n(1) / 100; break;
         case "Ts": gs.rise = n(1); break;
-        case "Tj": { const s = stack[stack.length - 1]; if (isStr(s)) showText(s.v); break; }
-        case "'": { tlm = matMul([1, 0, 0, 1, 0, -gs.leading], tlm); tm = tlm; const s = stack[stack.length - 1]; if (isStr(s)) showText(s.v); break; }
-        case "\"": { gs.wordSp = n(3); gs.charSp = n(2); tlm = matMul([1, 0, 0, 1, 0, -gs.leading], tlm); tm = tlm; const s = stack[stack.length - 1]; if (isStr(s)) showText(s.v); break; }
+        case "Tj": { const s = stack[stack.length - 1]; if (isStr(s)) tm = this.showText(gs, tm, s.v, page); break; }
+        case "'": { tlm = matMul([1, 0, 0, 1, 0, -gs.leading], tlm); tm = tlm; const s = stack[stack.length - 1]; if (isStr(s)) tm = this.showText(gs, tm, s.v, page); break; }
+        case "\"": { gs.wordSp = n(3); gs.charSp = n(2); tlm = matMul([1, 0, 0, 1, 0, -gs.leading], tlm); tm = tlm; const s = stack[stack.length - 1]; if (isStr(s)) tm = this.showText(gs, tm, s.v, page); break; }
         case "TJ": {
           const a = stack[stack.length - 1];
           if (isArr(a)) {
             for (const el of a.v) {
-              if (isStr(el)) showText(el.v);
+              if (isStr(el)) tm = this.showText(gs, tm, el.v, page);
               else if (isNum(el)) tm = matMul([1, 0, 0, 1, (-el / 1000) * gs.size * gs.hscale, 0], tm);
             }
           }
@@ -1822,7 +1868,7 @@ function assembleLines(items: TextItem[]): string[] {
     arr.push(it);
   }
   const pageNums: number[] = [];
-  byPage.forEach((_v: TextItem[], k: number) => pageNums.push(k));
+  for (const k of Array.from(byPage.keys())) pageNums.push(k);
   pageNums.sort((a, b) => a - b);
   for (const pn of pageNums) {
     const arr = byPage.get(pn) as TextItem[];
@@ -1903,7 +1949,7 @@ const WEAK_KEYWORDS = /betrag|zahlung|überweisung|ueberweisung|amount|payment|e
 const NEGATIVE_KEYWORDS = /skonto|abzug|rabatt|steuer|mwst|ust\b|vat|rechnungsbetrag|rechnungssumme|bruttobetrag|brutto|netto\b|offener|offene|restbetrag|fällig|iban|bic|datum|belegnr|beleg-?nr|rechnungsnr|rechnungs-?nummer|kundennr|kunden-?nummer|lieferantennr|seite|page|telefon|tel\.|fax|steuernummer|ust-id|konto\b|blz|zwischensumme|zinsen|mahn/i;
 
 function normalizeLine(line: string): string {
-  let s = line.replace(/ /g, " ");
+  let s = line.replace(/\u00A0/g, " "); // no-break space
   // glue thousands separators / decimals that got split by positioning: "3 . 454 , 00" -> "3.454,00"
   s = s.replace(/(\d)\s*\.\s*(\d{3})(?=[^\d]|$)/g, "$1.$2");
   s = s.replace(/(\d)\s*,\s*(\d{2})(?=[^\d]|$)/g, "$1,$2");
@@ -1961,7 +2007,8 @@ function detectCurrency(text: string): string {
 function pickAmount(lines: string[], extraKeywords: string): { best: Candidate | null; candidates: Candidate[]; currency: string } {
   const text = lines.join("\n");
   const currency = detectCurrency(text);
-  const normLines = lines.map(normalizeLine);
+  const normLines: string[] = [];
+  for (const l of lines) normLines.push(normalizeLine(l));
   const englishFormat = (currency === "USD" || currency === "GBP") && !/\d\.\d{3},\d{2}/.test(text) && /\d,\d{3}\.\d{2}|\d\.\d{2}\b/.test(text);
   let extra: RegExp | null = null;
   const ek = extraKeywords.split(/[,;|]/).map((s) => s.trim()).filter((s) => s.length > 0);
@@ -2064,10 +2111,12 @@ const MAX_TEXT_CHARS = 100000;
 function extractPdf(bytes: Uint8Array): { lines: string[]; pages: number; warnings: string[]; encrypted: boolean } {
   const s = bytesToLatin1(bytes, 0, bytes.length);
   const doc = new PdfDoc(s);
+  doc.load();
   if (doc.encrypted) return { lines: [], pages: 0, warnings: doc.warnings, encrypted: true };
   const pages = doc.pages();
   const interp = new ContentInterpreter(doc);
   for (let i = 0; i < pages.length; i++) {
+    if (Date.now() > runDeadline) { doc.warnings.push("time budget exhausted, text truncated"); break; }
     try {
       const content = doc.pageContent(pages[i].dict);
       interp.runPage(content, pages[i].resources, i);
@@ -2092,6 +2141,7 @@ function emptyResult(): AvisResult {
 function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?: string): AvisResult {
   const res = emptyResult();
   totalDecoded = 0;
+  runDeadline = Date.now() + 90000; // stay well below the 120 s Power Automate limit
   try {
     if (!pdfBase64 || pdfBase64.length < 16) { res.error = "no PDF content passed"; return res; }
     const bytes = base64ToBytes(pdfBase64);
