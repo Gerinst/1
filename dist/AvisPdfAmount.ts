@@ -187,12 +187,16 @@ class ByteSink {
   }
 }
 
-/** inflate raw deflate data starting at `pos`; returns [output, errorFlag] */
-function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
+/** result of a decoder: complete=false when the data ended early or was corrupt (text may be partial) */
+interface Decoded { data: Uint8Array; complete: boolean }
+
+/** inflate raw deflate data starting at `pos`; complete = the final block was decoded to its end */
+function inflateRaw(data: Uint8Array, pos: number): Decoded {
   const br = new BitReader(data, pos);
   const out = new ByteSink(data.length * 4);
   let last = 0;
   let broken = false;
+  let finished = false; // final block decoded to its end-of-block code
   while (!last && !broken) {
     last = br.bits(1);
     const type = br.bits(2);
@@ -209,6 +213,7 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
         if (br.pos >= data.length) { broken = true; break; }
         out.buf[out.len++] = data[br.pos++];
       }
+      if (!broken && last === 1) finished = true;
       continue;
     }
     let lit: Huffman, dist: Huffman;
@@ -271,6 +276,7 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
       if (sym < 256) {
         out.push(sym);
       } else if (sym === 256) {
+        if (last === 1) finished = true;
         break;
       } else {
         sym -= 257;
@@ -290,10 +296,10 @@ function inflateRaw(data: Uint8Array, pos: number): Uint8Array {
       }
     }
   }
-  return out.result();
+  return { data: out.result(), complete: finished && !broken };
 }
 
-function inflate(data: Uint8Array): Uint8Array {
+function inflate(data: Uint8Array): Decoded {
   let p = 0;
   // skip leading whitespace/garbage some producers emit before the zlib header
   while (p < data.length && (data[p] === 0x0a || data[p] === 0x0d || data[p] === 0x20 || data[p] === 0x09)) p++;
@@ -303,12 +309,13 @@ function inflate(data: Uint8Array): Uint8Array {
       let start = p + 2;
       if (flg & 0x20) start += 4; // preset dictionary id
       const r = inflateRaw(data, start);
-      if (r.length > 0) return r;
+      if (r.data.length > 0 || r.complete) return r; // an empty but well-formed stream is complete
     }
   }
   const raw = inflateRaw(data, p);
-  if (raw.length > 0) return raw;
-  return inflateRaw(data, p + 1); // last resort: one byte of junk
+  if (raw.data.length > 0 || raw.complete) return raw;
+  const junk = inflateRaw(data, p + 1); // last resort: one byte of junk
+  return { data: junk.data, complete: junk.complete || data.length === 0 };
 }
 
 // ---------------------------------------------------------------------
@@ -430,30 +437,29 @@ function runLengthDecode(data: Uint8Array): Uint8Array {
   return out.result();
 }
 
-function lzwDecode(data: Uint8Array, earlyChange: number): Uint8Array {
+/** LZW; complete = the end-of-data code was reached */
+function lzwDecode(data: Uint8Array, earlyChange: number): Decoded {
   const out = new ByteSink(data.length * 3);
-  let dict: number[][] = [];
-  const reset = (): void => {
-    dict = [];
-    for (let i = 0; i < 256; i++) dict.push([i]);
-    dict.push([]); // 256 = clear table
-    dict.push([]); // 257 = end of data
-  };
-  reset();
+  // no local reset helper: the table is built here once and cut back to 258 entries on a clear code
+  const dict: number[][] = [];
+  for (let i = 0; i < 256; i++) dict.push([i]);
+  dict.push([]); // 256 = clear table
+  dict.push([]); // 257 = end of data
   let codeLen = 9;
   let prev: number[] | null = null;
   let bitBuf = 0, bitCnt = 0, pos = 0;
+  let complete = false;
   while (true) {
     while (bitCnt < codeLen) {
-      if (pos >= data.length) return out.result();
+      if (pos >= data.length) return { data: out.result(), complete: false };
       bitBuf = ((bitBuf << 8) | data[pos++]) >>> 0;
       bitCnt += 8;
     }
     const code = (bitBuf >>> (bitCnt - codeLen)) & ((1 << codeLen) - 1);
     bitCnt -= codeLen;
     bitBuf &= (1 << bitCnt) - 1;
-    if (code === 256) { reset(); codeLen = 9; prev = null; continue; }
-    if (code === 257) break;
+    if (code === 256) { dict.length = 258; codeLen = 9; prev = null; continue; }
+    if (code === 257) { complete = true; break; }
     let entry: number[];
     if (code < dict.length) entry = dict[code];
     else if (prev) entry = prev.concat([prev[0]]);
@@ -463,7 +469,381 @@ function lzwDecode(data: Uint8Array, earlyChange: number): Uint8Array {
     prev = entry;
     if (dict.length + (earlyChange ? 1 : 0) >= (1 << codeLen) && codeLen < 12) codeLen++;
   }
-  return out.result();
+  return { data: out.result(), complete: complete };
+}
+
+// ---------------------------------------------------------------------
+// Crypto primitives for the Standard security handler: MD5, RC4,
+// SHA-256/384/512 (64-bit words as 32-bit hi/lo pairs, ES2017 has no
+// BigInt) and AES-CBC. Every function handles its whole input with the
+// block code inlined - no user function calls per byte or block, because
+// the Office Scripts runtime may turn each user call into an awaited call.
+// ---------------------------------------------------------------------
+const MD5_S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+const MD5_K: number[] = [];
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+const SHA256_H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+// SHA-512 round constants and initial values as [hi, lo, hi, lo, ...]
+const SHA512_K = [
+  0x428a2f98, 0xd728ae22, 0x71374491, 0x23ef65cd, 0xb5c0fbcf, 0xec4d3b2f, 0xe9b5dba5, 0x8189dbbc,
+  0x3956c25b, 0xf348b538, 0x59f111f1, 0xb605d019, 0x923f82a4, 0xaf194f9b, 0xab1c5ed5, 0xda6d8118,
+  0xd807aa98, 0xa3030242, 0x12835b01, 0x45706fbe, 0x243185be, 0x4ee4b28c, 0x550c7dc3, 0xd5ffb4e2,
+  0x72be5d74, 0xf27b896f, 0x80deb1fe, 0x3b1696b1, 0x9bdc06a7, 0x25c71235, 0xc19bf174, 0xcf692694,
+  0xe49b69c1, 0x9ef14ad2, 0xefbe4786, 0x384f25e3, 0x0fc19dc6, 0x8b8cd5b5, 0x240ca1cc, 0x77ac9c65,
+  0x2de92c6f, 0x592b0275, 0x4a7484aa, 0x6ea6e483, 0x5cb0a9dc, 0xbd41fbd4, 0x76f988da, 0x831153b5,
+  0x983e5152, 0xee66dfab, 0xa831c66d, 0x2db43210, 0xb00327c8, 0x98fb213f, 0xbf597fc7, 0xbeef0ee4,
+  0xc6e00bf3, 0x3da88fc2, 0xd5a79147, 0x930aa725, 0x06ca6351, 0xe003826f, 0x14292967, 0x0a0e6e70,
+  0x27b70a85, 0x46d22ffc, 0x2e1b2138, 0x5c26c926, 0x4d2c6dfc, 0x5ac42aed, 0x53380d13, 0x9d95b3df,
+  0x650a7354, 0x8baf63de, 0x766a0abb, 0x3c77b2a8, 0x81c2c92e, 0x47edaee6, 0x92722c85, 0x1482353b,
+  0xa2bfe8a1, 0x4cf10364, 0xa81a664b, 0xbc423001, 0xc24b8b70, 0xd0f89791, 0xc76c51a3, 0x0654be30,
+  0xd192e819, 0xd6ef5218, 0xd6990624, 0x5565a910, 0xf40e3585, 0x5771202a, 0x106aa070, 0x32bbd1b8,
+  0x19a4c116, 0xb8d2d0c8, 0x1e376c08, 0x5141ab53, 0x2748774c, 0xdf8eeb99, 0x34b0bcb5, 0xe19b48a8,
+  0x391c0cb3, 0xc5c95a63, 0x4ed8aa4a, 0xe3418acb, 0x5b9cca4f, 0x7763e373, 0x682e6ff3, 0xd6b2b8a3,
+  0x748f82ee, 0x5defb2fc, 0x78a5636f, 0x43172f60, 0x84c87814, 0xa1f0ab72, 0x8cc70208, 0x1a6439ec,
+  0x90befffa, 0x23631e28, 0xa4506ceb, 0xde82bde9, 0xbef9a3f7, 0xb2c67915, 0xc67178f2, 0xe372532b,
+  0xca273ece, 0xea26619c, 0xd186b8c7, 0x21c0c207, 0xeada7dd6, 0xcde0eb1e, 0xf57d4f7f, 0xee6ed178,
+  0x06f067aa, 0x72176fba, 0x0a637dc5, 0xa2c898a6, 0x113f9804, 0xbef90dae, 0x1b710b35, 0x131c471b,
+  0x28db77f5, 0x23047d84, 0x32caab7b, 0x40c72493, 0x3c9ebe0a, 0x15c9bebc, 0x431d67c4, 0x9c100d4c,
+  0x4cc5d4be, 0xcb3e42b6, 0x597f299c, 0xfc657e2a, 0x5fcb6fab, 0x3ad6faec, 0x6c44198c, 0x4a475817,
+];
+const SHA512_H = [
+  0x6a09e667, 0xf3bcc908, 0xbb67ae85, 0x84caa73b, 0x3c6ef372, 0xfe94f82b, 0xa54ff53a, 0x5f1d36f1,
+  0x510e527f, 0xade682d1, 0x9b05688c, 0x2b3e6c1f, 0x1f83d9ab, 0xfb41bd6b, 0x5be0cd19, 0x137e2179,
+];
+const SHA384_H = [
+  0xcbbb9d5d, 0xc1059ed8, 0x629a292a, 0x367cd507, 0x9159015a, 0x3070dd17, 0x152fecd8, 0xf70e5939,
+  0x67332667, 0xffc00b31, 0x8eb44a87, 0x68581511, 0xdb0c2e0d, 0x64f98fa7, 0x47b5481d, 0xbefa4fa4,
+];
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array, n: number): boolean {
+  if (a.length < n || b.length < n) return false;
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function md5(data: Uint8Array): Uint8Array {
+  if (MD5_K.length === 0) for (let i = 0; i < 64; i++) MD5_K.push(Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0);
+  const n = data.length;
+  const end = (((n + 8) >>> 6) + 1) * 64;
+  const buf = new Uint8Array(end);
+  buf.set(data);
+  buf[n] = 0x80;
+  const bitLo = (n * 8) >>> 0, bitHi = Math.floor(n / 536870912);
+  buf[end - 8] = bitLo & 255; buf[end - 7] = (bitLo >>> 8) & 255; buf[end - 6] = (bitLo >>> 16) & 255; buf[end - 5] = bitLo >>> 24;
+  buf[end - 4] = bitHi & 255; buf[end - 3] = (bitHi >>> 8) & 255; buf[end - 2] = (bitHi >>> 16) & 255; buf[end - 1] = bitHi >>> 24;
+  let h0 = 0x67452301, h1 = 0xefcdab89 | 0, h2 = 0x98badcfe | 0, h3 = 0x10325476;
+  const M = new Int32Array(16);
+  for (let off = 0; off < end; off += 64) {
+    for (let j = 0; j < 16; j++) {
+      const p = off + j * 4;
+      M[j] = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24);
+    }
+    let a = h0, b = h1, c = h2, d = h3;
+    for (let i = 0; i < 64; i++) {
+      let f = 0, g = 0;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) & 15; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) & 15; }
+      else { f = c ^ (b | ~d); g = (7 * i) & 15; }
+      const x = (a + f + MD5_K[i] + M[g]) | 0;
+      const s = MD5_S[i];
+      a = d; d = c; c = b;
+      b = (b + ((x << s) | (x >>> (32 - s)))) | 0;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+  }
+  const out = new Uint8Array(16);
+  const hs = [h0, h1, h2, h3];
+  for (let i = 0; i < 4; i++) {
+    out[i * 4] = hs[i] & 255; out[i * 4 + 1] = (hs[i] >>> 8) & 255; out[i * 4 + 2] = (hs[i] >>> 16) & 255; out[i * 4 + 3] = hs[i] >>> 24;
+  }
+  return out;
+}
+
+function rc4(key: Uint8Array, data: Uint8Array): Uint8Array {
+  const out = new Uint8Array(data.length);
+  const kl = key.length;
+  if (kl === 0) { out.set(data); return out; }
+  const S = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) S[i] = i;
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + S[i] + key[i % kl]) & 255;
+    const t = S[i]; S[i] = S[j]; S[j] = t;
+  }
+  let i = 0;
+  j = 0;
+  for (let k = 0; k < data.length; k++) {
+    i = (i + 1) & 255;
+    j = (j + S[i]) & 255;
+    const t = S[i]; S[i] = S[j]; S[j] = t;
+    out[k] = data[k] ^ S[(S[i] + S[j]) & 255];
+  }
+  return out;
+}
+
+function sha256(data: Uint8Array): Uint8Array {
+  const n = data.length;
+  const end = (((n + 8) >>> 6) + 1) * 64;
+  const buf = new Uint8Array(end);
+  buf.set(data);
+  buf[n] = 0x80;
+  const bitLo = (n * 8) >>> 0, bitHi = Math.floor(n / 536870912);
+  buf[end - 1] = bitLo & 255; buf[end - 2] = (bitLo >>> 8) & 255; buf[end - 3] = (bitLo >>> 16) & 255; buf[end - 4] = bitLo >>> 24;
+  buf[end - 5] = bitHi & 255; buf[end - 6] = (bitHi >>> 8) & 255; buf[end - 7] = (bitHi >>> 16) & 255; buf[end - 8] = bitHi >>> 24;
+  const H = new Int32Array(8);
+  for (let i = 0; i < 8; i++) H[i] = SHA256_H[i] | 0;
+  const W = new Int32Array(64);
+  for (let off = 0; off < end; off += 64) {
+    for (let t = 0; t < 16; t++) {
+      const p = off + t * 4;
+      W[t] = (buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3];
+    }
+    for (let t = 16; t < 64; t++) {
+      const w15 = W[t - 15], w2 = W[t - 2];
+      const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
+      const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
+      W[t] = (W[t - 16] + s0 + W[t - 7] + s1) | 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let t = 0; t < 64; t++) {
+      const s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const choose = (e & f) ^ (~e & g);
+      const t1 = (h + s1 + choose + SHA256_K[t] + W[t]) | 0;
+      const s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+  }
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 8; i++) {
+    out[i * 4] = H[i] >>> 24; out[i * 4 + 1] = (H[i] >>> 16) & 255; out[i * 4 + 2] = (H[i] >>> 8) & 255; out[i * 4 + 3] = H[i] & 255;
+  }
+  return out;
+}
+
+/** SHA-512, or SHA-384 when is384 (same compression, other IV, 48-byte output) */
+function sha512(data: Uint8Array, is384: boolean): Uint8Array {
+  const n = data.length;
+  const end = (((n + 16) >>> 7) + 1) * 128;
+  const buf = new Uint8Array(end);
+  buf.set(data);
+  buf[n] = 0x80;
+  const bitLo = (n * 8) >>> 0, bitHi = Math.floor(n / 536870912);
+  buf[end - 1] = bitLo & 255; buf[end - 2] = (bitLo >>> 8) & 255; buf[end - 3] = (bitLo >>> 16) & 255; buf[end - 4] = bitLo >>> 24;
+  buf[end - 5] = bitHi & 255; buf[end - 6] = (bitHi >>> 8) & 255; buf[end - 7] = (bitHi >>> 16) & 255; buf[end - 8] = bitHi >>> 24;
+  const IV = is384 ? SHA384_H : SHA512_H;
+  const H = new Int32Array(16);
+  for (let i = 0; i < 16; i++) H[i] = IV[i] | 0;
+  const W = new Int32Array(160);
+  for (let off = 0; off < end; off += 128) {
+    for (let t = 0; t < 32; t++) {
+      const p = off + t * 4;
+      W[t] = (buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3];
+    }
+    for (let t = 16; t < 80; t++) {
+      let xh = W[(t - 15) * 2], xl = W[(t - 15) * 2 + 1];
+      // sigma0 = ROTR1 ^ ROTR8 ^ SHR7
+      const s0h = ((xh >>> 1) | (xl << 31)) ^ ((xh >>> 8) | (xl << 24)) ^ (xh >>> 7);
+      const s0l = ((xl >>> 1) | (xh << 31)) ^ ((xl >>> 8) | (xh << 24)) ^ ((xl >>> 7) | (xh << 25));
+      xh = W[(t - 2) * 2]; xl = W[(t - 2) * 2 + 1];
+      // sigma1 = ROTR19 ^ ROTR61 ^ SHR6
+      const s1h = ((xh >>> 19) | (xl << 13)) ^ ((xl >>> 29) | (xh << 3)) ^ (xh >>> 6);
+      const s1l = ((xl >>> 19) | (xh << 13)) ^ ((xh >>> 29) | (xl << 3)) ^ ((xl >>> 6) | (xh << 26));
+      const lo = (s1l >>> 0) + (W[(t - 7) * 2 + 1] >>> 0) + (s0l >>> 0) + (W[(t - 16) * 2 + 1] >>> 0);
+      W[t * 2] = (s1h + W[(t - 7) * 2] + s0h + W[(t - 16) * 2] + ((lo / 4294967296) >>> 0)) | 0;
+      W[t * 2 + 1] = lo | 0;
+    }
+    let ah = H[0], al = H[1], bh = H[2], bl = H[3], ch = H[4], cl = H[5], dh = H[6], dl = H[7];
+    let eh = H[8], el = H[9], fh = H[10], fl = H[11], gh = H[12], gl = H[13], hh = H[14], hl = H[15];
+    for (let t = 0; t < 80; t++) {
+      // T1 = h + Sigma1(e) + Ch(e, f, g) + K[t] + W[t]; Sigma1 = ROTR14 ^ ROTR18 ^ ROTR41
+      const S1h = ((eh >>> 14) | (el << 18)) ^ ((eh >>> 18) | (el << 14)) ^ ((el >>> 9) | (eh << 23));
+      const S1l = ((el >>> 14) | (eh << 18)) ^ ((el >>> 18) | (eh << 14)) ^ ((eh >>> 9) | (el << 23));
+      const chooseH = (eh & fh) ^ (~eh & gh), chooseL = (el & fl) ^ (~el & gl);
+      let lo = (hl >>> 0) + (S1l >>> 0) + (chooseL >>> 0) + (SHA512_K[t * 2 + 1] >>> 0) + (W[t * 2 + 1] >>> 0);
+      const t1h = (hh + S1h + chooseH + SHA512_K[t * 2] + W[t * 2] + ((lo / 4294967296) >>> 0)) | 0, t1l = lo | 0;
+      // T2 = Sigma0(a) + Maj(a, b, c); Sigma0 = ROTR28 ^ ROTR34 ^ ROTR39
+      const S0h = ((ah >>> 28) | (al << 4)) ^ ((al >>> 2) | (ah << 30)) ^ ((al >>> 7) | (ah << 25));
+      const S0l = ((al >>> 28) | (ah << 4)) ^ ((ah >>> 2) | (al << 30)) ^ ((ah >>> 7) | (al << 25));
+      const majH = (ah & bh) ^ (ah & ch) ^ (bh & ch), majL = (al & bl) ^ (al & cl) ^ (bl & cl);
+      lo = (S0l >>> 0) + (majL >>> 0);
+      const t2h = (S0h + majH + ((lo / 4294967296) >>> 0)) | 0, t2l = lo | 0;
+      hh = gh; hl = gl; gh = fh; gl = fl; fh = eh; fl = el;
+      lo = (dl >>> 0) + (t1l >>> 0);
+      eh = (dh + t1h + ((lo / 4294967296) >>> 0)) | 0; el = lo | 0;
+      dh = ch; dl = cl; ch = bh; cl = bl; bh = ah; bl = al;
+      lo = (t1l >>> 0) + (t2l >>> 0);
+      ah = (t1h + t2h + ((lo / 4294967296) >>> 0)) | 0; al = lo | 0;
+    }
+    const R = [ah, al, bh, bl, ch, cl, dh, dl, eh, el, fh, fl, gh, gl, hh, hl];
+    for (let i = 0; i < 16; i += 2) {
+      const lo = (H[i + 1] >>> 0) + (R[i + 1] >>> 0);
+      H[i] = (H[i] + R[i] + ((lo / 4294967296) >>> 0)) | 0;
+      H[i + 1] = lo | 0;
+    }
+  }
+  const outLen = is384 ? 48 : 64;
+  const out = new Uint8Array(outLen);
+  for (let i = 0; i < outLen / 4; i++) {
+    out[i * 4] = H[i] >>> 24; out[i * 4 + 1] = (H[i] >>> 16) & 255; out[i * 4 + 2] = (H[i] >>> 8) & 255; out[i * 4 + 3] = H[i] & 255;
+  }
+  return out;
+}
+
+// AES lookup tables: [enc T0..T3, sbox, dec T0..T3, inverse sbox], built once
+let AES_T: Int32Array[] = [];
+
+function aesTables(): Int32Array[] {
+  if (AES_T.length > 0) return AES_T;
+  const t: Int32Array[] = [];
+  for (let i = 0; i < 10; i++) t.push(new Int32Array(256));
+  const sbox = t[4], inv = t[9];
+  const dbl = new Int32Array(256), third = new Int32Array(256);
+  for (let i = 0; i < 256; i++) { dbl[i] = (i << 1) ^ ((i >> 7) * 283); third[dbl[i] ^ i] = i; }
+  let x = 0, xInv = 0;
+  for (let n = 0; n < 256; n++) {
+    let s = xInv ^ (xInv << 1) ^ (xInv << 2) ^ (xInv << 3) ^ (xInv << 4);
+    s = (s >> 8) ^ (s & 255) ^ 99;
+    sbox[x] = s;
+    inv[s] = x;
+    const x2 = dbl[x], x4 = dbl[x2], x8 = dbl[x4];
+    let tDec = (x8 * 0x1010101) ^ (x4 * 0x10001) ^ (x2 * 0x101) ^ (x * 0x1010100);
+    let tEnc = (dbl[s] * 0x101) ^ (s * 0x1010100);
+    for (let i = 0; i < 4; i++) {
+      tEnc = (tEnc << 24) ^ (tEnc >>> 8);
+      t[i][x] = tEnc;
+      tDec = (tDec << 24) ^ (tDec >>> 8);
+      t[5 + i][s] = tDec;
+    }
+    x ^= x2 || 1;
+    xInv = third[xInv] || 1;
+  }
+  AES_T = t;
+  return t;
+}
+
+/**
+ * AES-CBC (128/192/256-bit key) over data[start..], whole 16-byte blocks only, no padding handling.
+ * decrypt=false encrypts (needed by the R6 password hash).
+ */
+function aesCbc(key: Uint8Array, iv: Uint8Array, data: Uint8Array, start: number, decrypt: boolean): Uint8Array {
+  const T = aesTables();
+  const sbox = T[4];
+  const nk = key.length >> 2;
+  const total = 4 * nk + 28;
+  const ek = new Int32Array(total);
+  for (let i = 0; i < nk; i++) ek[i] = (key[4 * i] << 24) | (key[4 * i + 1] << 16) | (key[4 * i + 2] << 8) | key[4 * i + 3];
+  let rcon = 1;
+  for (let i = nk; i < total; i++) {
+    let tmp = ek[i - 1];
+    if (i % nk === 0 || (nk === 8 && i % nk === 4)) {
+      tmp = (sbox[tmp >>> 24] << 24) ^ (sbox[(tmp >> 16) & 255] << 16) ^ (sbox[(tmp >> 8) & 255] << 8) ^ sbox[tmp & 255];
+      if (i % nk === 0) {
+        tmp = (tmp << 8) ^ (tmp >>> 24) ^ (rcon << 24);
+        rcon = (rcon << 1) ^ ((rcon >> 7) * 283);
+      }
+    }
+    ek[i] = ek[i - nk] ^ tmp;
+  }
+  let k = ek;
+  if (decrypt) {
+    const dk = new Int32Array(total);
+    for (let j = 0, i = total; i > 0; j++, i--) {
+      const tmp = ek[(j & 3) !== 0 ? i : i - 4];
+      if (i <= 4 || j < 4) dk[j] = tmp;
+      else dk[j] = T[5][sbox[tmp >>> 24]] ^ T[6][sbox[(tmp >> 16) & 255]] ^ T[7][sbox[(tmp >> 8) & 255]] ^ T[8][sbox[tmp & 255]];
+    }
+    k = dk;
+  }
+  const t0 = decrypt ? T[5] : T[0], t1 = decrypt ? T[6] : T[1], t2 = decrypt ? T[7] : T[2], t3 = decrypt ? T[8] : T[3];
+  const sb = decrypt ? T[9] : T[4];
+  const inner = total / 4 - 2;
+  const len = Math.max(0, Math.floor((data.length - start) / 16) * 16);
+  const out = new Uint8Array(len);
+  let p0 = (iv[0] << 24) | (iv[1] << 16) | (iv[2] << 8) | iv[3];
+  let p1 = (iv[4] << 24) | (iv[5] << 16) | (iv[6] << 8) | iv[7];
+  let p2 = (iv[8] << 24) | (iv[9] << 16) | (iv[10] << 8) | iv[11];
+  let p3 = (iv[12] << 24) | (iv[13] << 16) | (iv[14] << 8) | iv[15];
+  const o = new Int32Array(4);
+  for (let off = 0; off < len; off += 16) {
+    const s = start + off;
+    let w0 = (data[s] << 24) | (data[s + 1] << 16) | (data[s + 2] << 8) | data[s + 3];
+    let w1 = (data[s + 4] << 24) | (data[s + 5] << 16) | (data[s + 6] << 8) | data[s + 7];
+    let w2 = (data[s + 8] << 24) | (data[s + 9] << 16) | (data[s + 10] << 8) | data[s + 11];
+    let w3 = (data[s + 12] << 24) | (data[s + 13] << 16) | (data[s + 14] << 8) | data[s + 15];
+    if (!decrypt) { w0 ^= p0; w1 ^= p1; w2 ^= p2; w3 ^= p3; }
+    let a = w0 ^ k[0], b = (decrypt ? w3 : w1) ^ k[1], c = w2 ^ k[2], d = (decrypt ? w1 : w3) ^ k[3];
+    let ki = 4;
+    for (let r = 0; r < inner; r++) {
+      const a2 = t0[a >>> 24] ^ t1[(b >> 16) & 255] ^ t2[(c >> 8) & 255] ^ t3[d & 255] ^ k[ki];
+      const b2 = t0[b >>> 24] ^ t1[(c >> 16) & 255] ^ t2[(d >> 8) & 255] ^ t3[a & 255] ^ k[ki + 1];
+      const c2 = t0[c >>> 24] ^ t1[(d >> 16) & 255] ^ t2[(a >> 8) & 255] ^ t3[b & 255] ^ k[ki + 2];
+      d = t0[d >>> 24] ^ t1[(a >> 16) & 255] ^ t2[(b >> 8) & 255] ^ t3[c & 255] ^ k[ki + 3];
+      ki += 4;
+      a = a2; b = b2; c = c2;
+    }
+    for (let i = 0; i < 4; i++) {
+      o[decrypt ? (3 & -i) : i] = (sb[a >>> 24] << 24) ^ (sb[(b >> 16) & 255] << 16) ^ (sb[(c >> 8) & 255] << 8) ^ sb[d & 255] ^ k[ki++];
+      const tmp = a; a = b; b = c; c = d; d = tmp;
+    }
+    let r0 = o[0], r1 = o[1], r2 = o[2], r3 = o[3];
+    if (decrypt) {
+      r0 ^= p0; r1 ^= p1; r2 ^= p2; r3 ^= p3;
+      p0 = w0; p1 = w1; p2 = w2; p3 = w3;
+    } else {
+      p0 = r0; p1 = r1; p2 = r2; p3 = r3;
+    }
+    out[off] = r0 >>> 24; out[off + 1] = (r0 >>> 16) & 255; out[off + 2] = (r0 >>> 8) & 255; out[off + 3] = r0 & 255;
+    out[off + 4] = r1 >>> 24; out[off + 5] = (r1 >>> 16) & 255; out[off + 6] = (r1 >>> 8) & 255; out[off + 7] = r1 & 255;
+    out[off + 8] = r2 >>> 24; out[off + 9] = (r2 >>> 16) & 255; out[off + 10] = (r2 >>> 8) & 255; out[off + 11] = r2 & 255;
+    out[off + 12] = r3 >>> 24; out[off + 13] = (r3 >>> 16) & 255; out[off + 14] = (r3 >>> 8) & 255; out[off + 15] = r3 & 255;
+  }
+  return out;
+}
+
+/** Hash for R5 (plain SHA-256) and R6 (ISO 32000-2 algorithm 2.B) security handlers */
+function pdfPasswordHash(pw: Uint8Array, salt: Uint8Array, udata: Uint8Array, r6: boolean): Uint8Array {
+  let k = sha256(concatBytes([pw, salt, udata]));
+  if (!r6) return k;
+  for (let round = 1; round <= 320; round++) {
+    const seq = pw.length + k.length + udata.length;
+    const k1 = new Uint8Array(seq * 64);
+    for (let r = 0; r < 64; r++) {
+      const o = r * seq;
+      k1.set(pw, o);
+      k1.set(k, o + pw.length);
+      k1.set(udata, o + pw.length + k.length);
+    }
+    const e = aesCbc(k.subarray(0, 16), k.subarray(16, 32), k1, 0, false);
+    let sum = 0;
+    for (let j = 0; j < 16; j++) sum += e[j];
+    const m = sum % 3;
+    k = m === 0 ? sha256(e) : sha512(e, m === 1);
+    if (round >= 64 && e[e.length - 1] <= round - 32) break;
+  }
+  return k.subarray(0, 32);
 }
 
 // ---- generated tables (encodings as Unicode code points, 0 = undefined) ----
@@ -635,7 +1015,9 @@ interface PRef { t: "ref"; n: number; g: number }
 interface PArr { t: "arr"; v: PObj[] }
 interface PDict { t: "dict"; m: Map<string, PObj> }
 interface PKw { t: "kw"; v: string }            // keyword / content-stream operator
-interface PStream { t: "stream"; d: PDict; raw: string; id: number }
+// n/g: object and generation number (key for decryption); start: offset of the data in the file;
+// exactLen: raw was cut by a direct /Length (false = cut at "endstream", may be refined later)
+interface PStream { t: "stream"; d: PDict; raw: string; id: number; n: number; g: number; start: number; exactLen: boolean }
 type PObj = number | boolean | null | PName | PStr | PRef | PArr | PDict | PKw | PStream;
 
 function isName(o: PObj): o is PName { return typeof o === "object" && o !== null && o.t === "name"; }
@@ -665,12 +1047,15 @@ function isRegular(c: number): boolean {
 // ---------------------------------------------------------------------
 // Lexer / parser over a latin1 string
 // ---------------------------------------------------------------------
+// Lexer.unterminated: a literal string ran to the end of the input
 class Lexer {
   s: string;
   pos: number;
+  unterminated: boolean;
   constructor(s: string, pos: number) {
     this.s = s;
     this.pos = pos;
+    this.unterminated = false;
   }
   skipWs(): void {
     const s = this.s;
@@ -705,7 +1090,13 @@ class Lexer {
       this.pos++;
       let raw = this.readRegular();
       if (raw.indexOf("#") >= 0) {
-        raw = raw.replace(/#([0-9A-Fa-f]{2})/g, (_m: string, h: string) => String.fromCharCode(parseInt(h, 16)));
+        let dec = "";
+        for (let i = 0; i < raw.length; i++) {
+          const h = raw.substring(i + 1, i + 3);
+          if (raw.charAt(i) === "#" && /^[0-9A-Fa-f]{2}$/.test(h)) { dec += String.fromCharCode(parseInt(h, 16)); i += 2; }
+          else dec += raw.charAt(i);
+        }
+        raw = dec;
       }
       return mkName(raw);
     }
@@ -757,13 +1148,7 @@ class Lexer {
     const d = mkDict();
     let pendingKey: string | null = null;
     const vals: PObj[] = [];
-    const flush = (): void => {
-      if (pendingKey !== null) {
-        d.m.set(pendingKey, vals.length > 0 ? vals[vals.length - 1] : null);
-      }
-      pendingKey = null;
-      vals.length = 0;
-    };
+    // (the key/value bookkeeping stays inline: a local helper could run out of order when the runtime makes it async)
     for (;;) {
       this.skipWs();
       if (this.pos >= s.length) break;
@@ -775,7 +1160,8 @@ class Lexer {
       const o = this.parse(depth + 1);
       if (o === null) { if (this.pos >= s.length) break; vals.push(null); continue; }
       if (isName(o) && (pendingKey === null || vals.length > 0)) {
-        flush();
+        if (pendingKey !== null) d.m.set(pendingKey, vals.length > 0 ? vals[vals.length - 1] : null);
+        vals.length = 0;
         pendingKey = o.v;
         continue;
       }
@@ -793,7 +1179,7 @@ class Lexer {
       }
       vals.push(o);
     }
-    flush();
+    if (pendingKey !== null) d.m.set(pendingKey, vals.length > 0 ? vals[vals.length - 1] : null);
     return d;
   }
   parseLiteralString(): PStr {
@@ -826,6 +1212,7 @@ class Lexer {
       else if (c === 41) { depth--; if (depth === 0) break; out += ")"; }
       else out += String.fromCharCode(c);
     }
+    if (depth > 0) this.unterminated = true;
     return { t: "str", v: out };
   }
   parseHexString(): PStr {
@@ -851,10 +1238,31 @@ class Lexer {
 
 // ---------------------------------------------------------------------
 // Document: object map (brute-force scan, later definitions win),
-// object streams, trailer, stream decoding, page tree
+// object streams, trailer, decryption, stream decoding, page tree
 // ---------------------------------------------------------------------
-interface ObjEntry { obj: PObj; pos: number }
+interface ObjEntry { obj: PObj; pos: number; gen: number }
 
+// Standard security handler opened with the empty user password
+interface CryptState {
+  key: Uint8Array;               // file encryption key
+  rev: number;                   // /R
+  stmF: string;                  // method for streams: none / rc4 / aesv2 / aesv3
+  strF: string;                  // method for strings
+  filters: Map<string, string>;  // crypt filter name -> method (streams with a /Crypt filter)
+  encryptMetadata: boolean;
+  encNum: number;                // object number of the encryption dictionary (-1 = direct)
+}
+
+interface PageRef { dict: PDict; resources: PDict | null; box: number[] }
+
+const PDF_PASSWORD_PAD = [0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08, 0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a];
+
+// PdfDoc fields:
+//   encrypted: the trailer names an /Encrypt dictionary
+//   fileId: first element of the trailer /ID
+//   cryptStatus: none / decrypted / password / certificate / unsupported
+//   incomplete: reasons why the extracted text may be partial
+//   ocOff: optional-content groups that are OFF by default
 class PdfDoc {
   s: string;
   objs: Map<number, ObjEntry>;
@@ -864,6 +1272,16 @@ class PdfDoc {
   encrypted: boolean;
   warnings: string[];
   nextStreamId: number;
+  encryptObj: PObj | null;
+  fileId: string;
+  infoObj: PObj | null;
+  crypt: CryptState | null;
+  cryptStatus: string;
+  cryptDetail: string;
+  incomplete: string[];
+  ocOff: Set<PDict>;
+  ocUsed: boolean;
+  keyCache: Map<string, Uint8Array>;
 
   constructor(s: string) {
     this.s = s;
@@ -874,12 +1292,32 @@ class PdfDoc {
     this.encrypted = false;
     this.warnings = [];
     this.nextStreamId = 1;
+    this.encryptObj = null;
+    this.fileId = "";
+    this.infoObj = null;
+    this.crypt = null;
+    this.cryptStatus = "none";
+    this.cryptDetail = "";
+    this.incomplete = [];
+    this.ocOff = new Set<PDict>();
+    this.ocUsed = false;
+    this.keyCache = new Map<string, Uint8Array>();
   }
 
   load(): void {
     // two-phase init keeps the constructor free of heavy work (Office Scripts restriction)
     this.scan();
-    this.expandObjectStreams();
+    if (this.encryptObj !== null) this.setupEncryption();
+    if (this.cryptStatus === "none" || this.cryptStatus === "decrypted") {
+      this.expandObjectStreams();
+      this.loadOptionalContent();
+    }
+    const tail = Math.max(0, this.s.length - 4096);
+    if (this.s.indexOf("%%EOF", tail) < 0) this.flagIncomplete("no %%EOF at the end of the file (truncated?)");
+  }
+
+  flagIncomplete(reason: string): void {
+    if (this.incomplete.length < 8 && this.incomplete.indexOf(reason) < 0) this.incomplete.push(reason);
   }
 
   private scan(): void {
@@ -888,9 +1326,14 @@ class PdfDoc {
     let m: RegExpExecArray | null;
     let guard = 0;
     while ((m = re.exec(s)) !== null) {
-      if (++guard > 500000) break;
-      if ((guard & 4095) === 0 && Date.now() > runDeadline) { this.warnings.push("time budget exhausted while scanning objects"); break; }
+      if (++guard > 500000) { this.flagIncomplete("too many objects"); break; }
+      if ((guard & 4095) === 0 && Date.now() > runDeadline) {
+        this.warnings.push("time budget exhausted while scanning objects");
+        this.flagIncomplete("time budget exhausted");
+        break;
+      }
       const num = parseInt(m[1], 10);
+      const gen = parseInt(m[2], 10);
       const start = m.index;
       let after = start + m[0].length;
       try {
@@ -900,46 +1343,53 @@ class PdfDoc {
         lx.skipWs();
         let end = lx.pos;
         if (isDict(obj) && s.substring(lx.pos, lx.pos + 6) === "stream") {
-          const r = this.readStream(obj, lx.pos + 6);
+          const r = this.readStream(obj, lx.pos + 6, num, gen);
           obj = r.stream;
           end = r.end;
         }
-        this.objs.set(num, { obj: obj, pos: start });
-        after = Math.max(after, end);
+        this.objs.set(num, { obj: obj, pos: start, gen: gen });
+        // an unbalanced "(" must not swallow the rest of the file: rescan right after the header, or
+        // after the first "endobj" when the parse ran past it (a later ")" closed the broken string)
+        const ej = isStream(obj) ? -1 : s.indexOf("endobj", after);
+        if (lx.unterminated) { /* keep after */ }
+        else if (ej >= 0 && ej + 6 < end) { after = ej + 6; this.flagIncomplete("object " + num + " is malformed"); }
+        else after = Math.max(after, end);
       } catch (e) {
         this.warnings.push("object " + num + ": " + String(e));
       }
       re.lastIndex = after;
     }
-    // trailer(s): the last one in the file is the newest
+    // trailer dictionaries (classic trailers and cross-reference streams), newest last
+    const trailers: { d: PDict; pos: number }[] = [];
     const tre = /trailer\s*<</g;
     let tm: RegExpExecArray | null;
-    let lastTrailerPos = -1;
     while ((tm = tre.exec(s)) !== null) {
       try {
         const lx = new Lexer(s, tm.index + 7);
         const d = lx.parse(0);
-        if (isDict(d)) {
-          if (d.m.has("Encrypt")) this.encrypted = true;
-          const root = d.m.get("Root");
-          if (root !== undefined && isRef(root)) { this.trailerRoot = root; lastTrailerPos = tm.index; }
-        }
+        if (isDict(d)) trailers.push({ d: d, pos: tm.index });
       } catch (e) { /* ignore */ }
     }
-    // cross-reference streams carry the trailer entries too
     for (const e of Array.from(this.objs.values())) {
       if (isStream(e.obj)) {
         const ty = e.obj.d.m.get("Type");
-        if (ty !== undefined && isName(ty) && ty.v === "XRef") {
-          if (e.obj.d.m.has("Encrypt")) this.encrypted = true;
-          const root = e.obj.d.m.get("Root");
-          if (root !== undefined && isRef(root) && e.pos > lastTrailerPos) { this.trailerRoot = root; lastTrailerPos = e.pos; }
-        }
+        if (ty !== undefined && isName(ty) && ty.v === "XRef") trailers.push({ d: e.obj.d, pos: e.pos });
       }
+    }
+    trailers.sort((a, b) => a.pos - b.pos);
+    for (const t of trailers) {
+      const root = t.d.m.get("Root");
+      if (root !== undefined && isRef(root)) this.trailerRoot = root;
+      const enc = t.d.m.get("Encrypt");
+      if (enc !== undefined && enc !== null) { this.encrypted = true; this.encryptObj = enc; }
+      const info = t.d.m.get("Info");
+      if (info !== undefined && info !== null) this.infoObj = info;
+      const id = t.d.m.get("ID");
+      if (id !== undefined && isArr(id) && id.v.length > 0 && isStr(id.v[0])) this.fileId = (id.v[0] as PStr).v;
     }
   }
 
-  private readStream(d: PDict, p: number): { stream: PStream; end: number } {
+  private readStream(d: PDict, p: number, num: number, gen: number): { stream: PStream; end: number } {
     const s = this.s;
     // after the 'stream' keyword: CRLF or LF
     if (s.charCodeAt(p) === 13) p++;
@@ -948,17 +1398,21 @@ class PdfDoc {
     let len = -1;
     const L = d.m.get("Length");
     if (L !== undefined && isNum(L)) len = L;
-    // (an indirect /Length is resolved by searching for "endstream" below)
+    // (an indirect /Length is resolved later in streamData)
     let dataEnd = -1;
     if (len >= 0 && dataStart + len <= s.length) {
       const probe = new Lexer(s, dataStart + len);
       probe.skipWs();
       if (s.substring(probe.pos, probe.pos + 9) === "endstream") dataEnd = dataStart + len;
     }
+    const exact = dataEnd >= 0;
     if (dataEnd < 0) {
       // fall back to searching the keyword
       let idx = s.indexOf("endstream", dataStart);
-      if (idx < 0) idx = s.length;
+      if (idx < 0) {
+        idx = s.length;
+        this.flagIncomplete("stream " + num + " has no endstream (file truncated?)");
+      }
       dataEnd = idx;
       // strip trailing EOL
       if (s.charCodeAt(dataEnd - 1) === 10) dataEnd--;
@@ -969,7 +1423,169 @@ class PdfDoc {
     end = end < 0 ? s.length : end + 9;
     const ej = s.indexOf("endobj", end);
     if (ej >= 0 && ej - end < 4) end = ej + 6;
-    return { stream: { t: "stream", d: d, raw: raw, id: this.nextStreamId++ }, end: end };
+    return { stream: { t: "stream", d: d, raw: raw, id: this.nextStreamId++, n: num, g: gen, start: dataStart, exactLen: exact }, end: end };
+  }
+
+  private setupEncryption(): void {
+    // Standard security handler (ISO 32000-2 7.6.4) opened with the empty user password
+    const enc = this.dictOf(this.encryptObj === null ? undefined : this.encryptObj);
+    if (!enc) { this.cryptFail("unsupported", "encryption dictionary not found"); return; }
+    const filter = this.nameOf(enc.m.get("Filter"));
+    if (filter.indexOf("PubSec") >= 0) { this.cryptFail("certificate", filter); return; }
+    if (filter !== "Standard") { this.cryptFail("unsupported", "security handler " + (filter || "?")); return; }
+    const v = this.num(enc.m.get("V"), 0);
+    const r = this.num(enc.m.get("R"), 0);
+    if (v !== 1 && v !== 2 && v !== 4 && v !== 5) { this.cryptFail("unsupported", "/V " + v); return; }
+    const o = this.strBytes(enc.m.get("O"));
+    const u = this.strBytes(enc.m.get("U"));
+    const p = this.num(enc.m.get("P"), 0) | 0;
+    const encryptMetadata = this.resolve(enc.m.get("EncryptMetadata")) !== false;
+    const methods = new Map<string, string>();
+    methods.set("Identity", "none");
+    let cfLen = 0;
+    const cf = this.dictOf(enc.m.get("CF"));
+    if (cf) {
+      for (const [name, val] of Array.from(cf.m.entries())) {
+        const cd = this.dictOf(val);
+        const cfm = cd ? this.nameOf(cd.m.get("CFM")) : "";
+        methods.set(name, cfm === "V2" ? "rc4" : cfm === "AESV2" ? "aesv2" : cfm === "AESV3" ? "aesv3" : cfm === "None" || cfm === "" ? "none" : "?" + cfm);
+        if (cd && cfLen === 0) cfLen = this.num(cd.m.get("Length"), 0);
+      }
+    }
+    let stmF = "rc4", strF = "rc4";
+    if (v >= 4) {
+      const sn = this.nameOf(enc.m.get("StmF")) || "Identity", tn = this.nameOf(enc.m.get("StrF")) || "Identity";
+      stmF = methods.get(sn) || "?" + sn;
+      strF = methods.get(tn) || "?" + tn;
+    }
+    if (stmF.charAt(0) === "?" || strF.charAt(0) === "?") { this.cryptFail("unsupported", "crypt filter " + (stmF.charAt(0) === "?" ? stmF : strF).substring(1)); return; }
+    // key length in bits (generators sometimes give bytes)
+    let lenBits = this.num(enc.m.get("Length"), 0);
+    if (lenBits <= 0) lenBits = v <= 2 ? 40 : cfLen > 0 ? cfLen : 128;
+    if (lenBits < 40) lenBits *= 8;
+    if (lenBits % 8 !== 0 || lenBits > 256) lenBits = 128;
+    const empty = new Uint8Array(0);
+    let key: Uint8Array;
+    if (r >= 2 && r <= 4) {
+      const n = r === 2 ? 5 : Math.max(5, Math.min(16, lenBits >> 3));
+      const id = latin1ToBytes(this.fileId);
+      const pad = new Uint8Array(PDF_PASSWORD_PAD);
+      const parts = [pad, o.subarray(0, 32), new Uint8Array([p & 255, (p >>> 8) & 255, (p >>> 16) & 255, (p >>> 24) & 255]), id];
+      if (r >= 4 && !encryptMetadata) parts.push(new Uint8Array([255, 255, 255, 255]));
+      let h = md5(concatBytes(parts));
+      if (r >= 3) for (let i = 0; i < 50; i++) h = md5(h.subarray(0, n));
+      key = h.subarray(0, n);
+      // the empty password is the user password only if it reproduces /U (algorithms 4 and 5)
+      let ok = false;
+      if (r === 2) ok = bytesEqual(rc4(key, pad), u, 32);
+      else {
+        let x = rc4(key, md5(concatBytes([pad, id])));
+        const k2 = new Uint8Array(n);
+        for (let i = 1; i <= 19; i++) {
+          for (let j = 0; j < n; j++) k2[j] = key[j] ^ i;
+          x = rc4(k2, x);
+        }
+        ok = bytesEqual(x, u, 16);
+      }
+      if (!ok) { this.cryptFail("password", ""); return; }
+    } else if (r === 5 || r === 6) {
+      const ue = this.strBytes(enc.m.get("UE"));
+      if (u.length < 48 || ue.length < 32) { this.cryptFail("unsupported", "/U or /UE too short"); return; }
+      const check = pdfPasswordHash(empty, u.subarray(32, 40), empty, r === 6);
+      if (!bytesEqual(check, u, 32)) { this.cryptFail("password", ""); return; }
+      const ik = pdfPasswordHash(empty, u.subarray(40, 48), empty, r === 6);
+      key = aesCbc(ik, new Uint8Array(16), ue.subarray(0, 32), 0, true);
+      const perms = this.strBytes(enc.m.get("Perms"));
+      if (perms.length >= 16) {
+        const dp = aesCbc(key, new Uint8Array(16), perms.subarray(0, 16), 0, true);
+        if (dp[9] !== 0x61 || dp[10] !== 0x64 || dp[11] !== 0x62) this.warnings.push("encryption: /Perms check failed");
+      }
+    } else {
+      this.cryptFail("unsupported", "/R " + r);
+      return;
+    }
+    this.crypt = {
+      key: key,
+      rev: r,
+      stmF: stmF,
+      strF: strF,
+      filters: methods,
+      encryptMetadata: encryptMetadata,
+      encNum: isRef(this.encryptObj) ? this.encryptObj.n : -1,
+    };
+    this.cryptStatus = "decrypted";
+    this.cryptDetail = "R" + r + " " + stmF;
+    this.decryptAllStrings();
+  }
+
+  private cryptFail(status: string, detail: string): void {
+    this.cryptStatus = status;
+    this.cryptDetail = detail;
+  }
+
+  private strBytes(o: PObj | undefined): Uint8Array {
+    const r = this.resolve(o);
+    return isStr(r) ? latin1ToBytes(r.v) : new Uint8Array(0);
+  }
+
+  private objectKey(num: number, gen: number, method: string): Uint8Array {
+    // per-object key (algorithm 1); AES-256 uses the file key directly
+    const c = this.crypt as CryptState;
+    if (method === "aesv3" || c.rev >= 5) return c.key;
+    const ck = num + "/" + gen + "/" + method;
+    const hit = this.keyCache.get(ck);
+    if (hit !== undefined) return hit;
+    const parts = [c.key, new Uint8Array([num & 255, (num >> 8) & 255, (num >> 16) & 255, gen & 255, (gen >> 8) & 255])];
+    if (method === "aesv2") parts.push(new Uint8Array([0x73, 0x41, 0x6c, 0x54])); // "sAlT"
+    const k = md5(concatBytes(parts)).subarray(0, Math.min(c.key.length + 5, 16));
+    this.keyCache.set(ck, k);
+    return k;
+  }
+
+  private decryptBytes(data: Uint8Array, num: number, gen: number, method: string): Uint8Array {
+    if (method === "none" || !this.crypt) return data;
+    const key = this.objectKey(num, gen, method);
+    if (method === "rc4") return rc4(key, data);
+    // AES-CBC: 16-byte IV in front, PKCS#5 padding at the end
+    if (data.length < 32) return new Uint8Array(0);
+    const out = aesCbc(key, data.subarray(0, 16), data, 16, true);
+    const padN = out.length > 0 ? out[out.length - 1] : 0;
+    return padN >= 1 && padN <= 16 && padN <= out.length ? out.subarray(0, out.length - padN) : out;
+  }
+
+  private decryptAllStrings(): void {
+    // strings of top-level objects (not inside object streams, not the encryption dictionary)
+    const c = this.crypt;
+    if (!c || c.strF === "none") return;
+    let count = 0;
+    for (const [num, e] of Array.from(this.objs.entries())) {
+      if ((++count & 1023) === 0 && Date.now() > runDeadline) { this.flagIncomplete("time budget exhausted"); break; }
+      if (num === c.encNum) continue;
+      let top: PObj = e.obj;
+      if (isStream(top)) {
+        const ty = top.d.m.get("Type");
+        if (ty !== undefined && isName(ty) && ty.v === "XRef") continue;
+        top = top.d;
+      }
+      if (isDict(top)) {
+        const ty = top.m.get("Type");
+        if (ty !== undefined && isName(ty) && ty.v === "Sig") continue;
+      }
+      const stack: PObj[] = [top];
+      let guard = 0;
+      while (stack.length > 0 && ++guard < 200000) {
+        const o = stack.pop();
+        if (o === undefined || o === null || typeof o !== "object") continue;
+        if (o.t === "str") {
+          const b = this.decryptBytes(latin1ToBytes(o.v), num, e.gen, c.strF);
+          o.v = bytesToLatin1(b, 0, b.length);
+        } else if (o.t === "arr") {
+          for (const x of o.v) stack.push(x);
+        } else if (o.t === "dict") {
+          for (const x of Array.from(o.m.values())) stack.push(x);
+        }
+      }
+    }
   }
 
   private expandObjectStreams(): void {
@@ -1002,13 +1618,61 @@ class PdfDoc {
           const existing = this.objs.get(onum);
           // position rule: the definition that appears later in the file wins
           if (existing === undefined || existing.pos < st.entry.pos) {
-            this.objs.set(onum, { obj: obj === null || isKw(obj) ? null : obj, pos: st.entry.pos });
+            this.objs.set(onum, { obj: obj === null || isKw(obj) ? null : obj, pos: st.entry.pos, gen: 0 });
           }
         }
       } catch (e) {
         this.warnings.push("ObjStm " + st.num + ": " + String(e));
       }
     }
+  }
+
+  private loadOptionalContent(): void {
+    // optional-content groups that are OFF in the default configuration (/OCProperties /D)
+    const cat = this.catalog();
+    const ocp = cat ? this.dictOf(cat.m.get("OCProperties")) : null;
+    if (!ocp) return;
+    this.ocUsed = true;
+    const d = this.dictOf(ocp.m.get("D"));
+    if (!d) return;
+    if (this.nameOf(d.m.get("BaseState")) === "OFF") {
+      for (const g of this.arrOf(ocp.m.get("OCGs"))) { const gd = this.dictOf(g); if (gd) this.ocOff.add(gd); }
+      for (const g of this.arrOf(d.m.get("ON"))) { const gd = this.dictOf(g); if (gd) this.ocOff.delete(gd); }
+    }
+    for (const g of this.arrOf(d.m.get("OFF"))) { const gd = this.dictOf(g); if (gd) this.ocOff.add(gd); }
+  }
+
+  isHiddenOC(o: PObj | undefined): boolean {
+    // true when an optional-content group or membership dictionary is OFF by default
+    if (!this.ocUsed || o === undefined) return false;
+    const d = this.dictOf(o);
+    if (!d) return false;
+    if (this.nameOf(d.m.get("Type")) !== "OCMD") return this.ocOff.has(d);
+    const raw = this.resolve(d.m.get("OCGs"));
+    const groups: PDict[] = [];
+    if (isDict(raw)) groups.push(raw);
+    else if (isArr(raw)) for (const g of raw.v) { const gd = this.dictOf(g); if (gd) groups.push(gd); }
+    if (groups.length === 0) return false;
+    let on = 0;
+    for (const g of groups) if (!this.ocOff.has(g)) on++;
+    const policy = this.nameOf(d.m.get("P"));
+    if (policy === "AllOn") return on < groups.length;
+    if (policy === "AnyOff") return on === groups.length;
+    if (policy === "AllOff") return on > 0;
+    return on === 0; // AnyOn (default)
+  }
+
+  producerInfo(): string {
+    // /Producer and /Creator of the document information dictionary (NULs of UTF-16 removed)
+    const info = this.dictOf(this.infoObj === null ? undefined : this.infoObj);
+    if (!info) return "";
+    let out = "";
+    const keys = ["Producer", "Creator"];
+    for (const k of keys) {
+      const v = this.resolve(info.m.get(k));
+      if (isStr(v)) out += " " + v.v.replace(/\u0000/g, "");
+    }
+    return out;
   }
 
   resolve(o: PObj | undefined): PObj {
@@ -1054,9 +1718,12 @@ class PdfDoc {
     const cached = this.streamCache.get(st.id);
     if (cached !== undefined) return cached;
     if (this.failedStreams.has(st.id)) throw new Error("stream could not be decoded (see its first warning)");
-    if (Date.now() > runDeadline) throw new Error("time budget exhausted");
+    if (Date.now() > runDeadline) {
+      this.flagIncomplete("time budget exhausted");
+      throw new Error("time budget exhausted");
+    }
     this.failedStreams.add(st.id); // removed again below on success: a broken or oversized stream is decoded only once
-    let data = latin1ToBytes(st.raw);
+    let data = latin1ToBytes(st.exactLen ? st.raw : this.refineRaw(st));
     const filters: string[] = [];
     const f = this.resolve(st.d.m.get("Filter"));
     if (isName(f)) filters.push(f.v);
@@ -1065,15 +1732,30 @@ class PdfDoc {
     const parms: (PDict | null)[] = [];
     if (isDict(parmsObj)) parms.push(parmsObj);
     else if (isArr(parmsObj)) for (const x of parmsObj.v) { const d = this.resolve(x); parms.push(isDict(d) ? d : null); }
+    if (this.crypt) {
+      let method = this.crypt.stmF;
+      const ty = this.nameOf(st.d.m.get("Type"));
+      if (filters.length > 0 && filters[0] === "Crypt") {
+        const cp = parms.length > 0 ? parms[0] : null;
+        const cn = cp ? this.nameOf(cp.m.get("Name")) : "";
+        const cm = this.crypt.filters.get(cn || "Identity");
+        method = cm === undefined || cm.charAt(0) === "?" ? "none" : cm;
+      } else if (ty === "XRef" || (ty === "Metadata" && !this.crypt.encryptMetadata)) {
+        method = "none";
+      }
+      if (method !== "none") data = this.decryptBytes(data, st.n, st.g, method);
+    }
     for (let i = 0; i < filters.length; i++) {
       const name = filters[i];
       const pd = parms.length === 1 && filters.length === 1 ? parms[0] : (parms[i] || null);
       if (name === "FlateDecode" || name === "Fl") {
-        data = inflate(data);
-        data = this.predict(data, pd);
+        const r = inflate(data);
+        if (!r.complete) this.flagIncomplete("compressed stream " + st.n + " is truncated or corrupt");
+        data = this.predict(r.data, pd);
       } else if (name === "LZWDecode" || name === "LZW") {
-        data = lzwDecode(data, this.num(pd ? pd.m.get("EarlyChange") : undefined, 1));
-        data = this.predict(data, pd);
+        const r = lzwDecode(data, this.num(pd ? pd.m.get("EarlyChange") : undefined, 1));
+        if (!r.complete) this.flagIncomplete("LZW stream " + st.n + " is truncated or corrupt");
+        data = this.predict(r.data, pd);
       } else if (name === "ASCIIHexDecode" || name === "AHx") {
         data = asciiHexDecode(data);
       } else if (name === "ASCII85Decode" || name === "A85") {
@@ -1081,7 +1763,7 @@ class PdfDoc {
       } else if (name === "RunLengthDecode" || name === "RL") {
         data = runLengthDecode(data);
       } else if (name === "Crypt") {
-        // identity crypt filter – nothing to do
+        // crypt filter: already applied above
       } else {
         // image / unsupported filters: leave as is
         break;
@@ -1090,6 +1772,17 @@ class PdfDoc {
     this.failedStreams.delete(st.id);
     this.streamCache.set(st.id, data);
     return data;
+  }
+  private refineRaw(st: PStream): string {
+    // stream cut at "endstream": an indirect /Length that ends right before "endstream" is exact
+    const len = this.num(st.d.m.get("Length"), -1);
+    const s = this.s;
+    if (len >= 0 && st.start + len <= s.length) {
+      const probe = new Lexer(s, st.start + len);
+      probe.skipWs();
+      if (s.substring(probe.pos, probe.pos + 9) === "endstream") return s.substring(st.start, st.start + len);
+    }
+    return st.raw;
   }
   private predict(data: Uint8Array, pd: PDict | null): Uint8Array {
     if (!pd) return data;
@@ -1102,12 +1795,17 @@ class PdfDoc {
     return bytesToLatin1(d, 0, d.length);
   }
 
-  pages(): { dict: PDict; resources: PDict | null }[] {
-    // page tree
-    const out: { dict: PDict; resources: PDict | null }[] = [];
-    const seen = new Set<PDict>();
+  catalog(): PDict | null {
     let root: PDict | null = this.trailerRoot ? this.dictOf(this.trailerRoot) : null;
     if (!root) root = this.findCatalog();
+    return root;
+  }
+
+  pages(): PageRef[] {
+    // page tree
+    const out: PageRef[] = [];
+    const seen = new Set<PDict>();
+    const root = this.catalog();
     const pagesRoot = root ? this.dictOf(root.m.get("Pages")) : null;
     if (pagesRoot) this.walkPages(pagesRoot, null, 0, out, seen);
     if (out.length === 0) {
@@ -1124,26 +1822,40 @@ class PdfDoc {
           res = this.dictOf(parent.m.get("Resources"));
           parent = this.dictOf(parent.m.get("Parent"));
         }
-        out.push({ dict: f.d, resources: res });
+        out.push({ dict: f.d, resources: res, box: this.pageBox(f.d) });
       }
     }
     return out;
   }
 
-  private walkPages(node: PDict, inherited: PDict | null, depth: number, out: { dict: PDict; resources: PDict | null }[], seen: Set<PDict>): void {
+  private walkPages(node: PDict, inherited: PDict | null, depth: number, out: PageRef[], seen: Set<PDict>): void {
     if (depth > 64 || seen.has(node)) return;
     seen.add(node);
     const res = this.dictOf(node.m.get("Resources")) || inherited;
     const type = this.nameOf(node.m.get("Type"));
     const kids = this.arrOf(node.m.get("Kids"));
     if (type === "Page" || (kids.length === 0 && node.m.has("Contents"))) {
-      out.push({ dict: node, resources: res });
+      out.push({ dict: node, resources: res, box: this.pageBox(node) });
       return;
     }
     for (const k of kids) {
       const kd = this.dictOf(k);
       if (kd) this.walkPages(kd, res, depth + 1, out, seen);
+      else if (isRef(k)) this.flagIncomplete("page object " + k.n + " missing");
     }
+  }
+
+  private pageBox(page: PDict): number[] {
+    // visible area: CropBox, else MediaBox (both inheritable), as [x0, y0, x1, y1]
+    let node: PDict | null = page;
+    let media: number[] = [], crop: number[] = [];
+    for (let i = 0; node && i < 32; i++) {
+      if (crop.length !== 4) crop = this.numArr(node.m.get("CropBox"), 0);
+      if (media.length !== 4) media = this.numArr(node.m.get("MediaBox"), 0);
+      node = this.dictOf(node.m.get("Parent"));
+    }
+    const b = crop.length === 4 ? crop : media.length === 4 ? media : [0, 0, 612, 792];
+    return [Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.max(b[0], b[2]), Math.max(b[1], b[3])];
   }
 
   private findCatalog(): PDict | null {
@@ -1155,16 +1867,19 @@ class PdfDoc {
   }
 
   pageContent(page: PDict): string {
-    const c = this.resolve(page.m.get("Contents"));
+    const raw = page.m.get("Contents");
+    const c = this.resolve(raw);
     if (isStream(c)) return this.streamText(c);
     if (isArr(c)) {
       let s = "";
       for (const x of c.v) {
         const st = this.resolve(x);
         if (isStream(st)) s += this.streamText(st) + "\n";
+        else if (isRef(x)) this.flagIncomplete("content stream " + x.n + " missing");
       }
       return s;
     }
+    if (raw !== undefined && isRef(raw)) this.flagIncomplete("content stream " + raw.n + " missing");
     return "";
   }
 }
@@ -1315,7 +2030,7 @@ function glyphNameToUnicode(name: string): string {
 // ---------------------------------------------------------------------
 // TrueType 'cmap' parsing (for fonts without ToUnicode)
 // ---------------------------------------------------------------------
-interface TtMaps { gidToUni: Map<number, string>; codeToGid: Map<number, number>; hasUni: boolean }
+interface TtMaps { gidToUni: Map<number, number>; codeToGid: Map<number, number>; hasUni: boolean }
 
 function parseTrueTypeCmap(data: Uint8Array): TtMaps | null {
   const u16 = (p: number): number => (data[p] << 8) | data[p + 1];
@@ -1334,15 +2049,11 @@ function parseTrueTypeCmap(data: Uint8Array): TtMaps | null {
     if (t === "cmap") { cmapOff = u32(rec + 8); cmapLen = u32(rec + 12); }
   }
   if (cmapOff < 0 || cmapOff + 4 > data.length || cmapLen < 4) return null;
-  const maps: TtMaps = { gidToUni: new Map<number, string>(), codeToGid: new Map<number, number>(), hasUni: false };
+  const maps: TtMaps = { gidToUni: new Map<number, number>(), codeToGid: new Map<number, number>(), hasUni: false };
   const n = u16(cmapOff + 2);
-  const addUni = (cp: number, gid: number): void => {
-    if (gid === 0) return;
-    if (!maps.gidToUni.has(gid)) {
-      if (cp <= 0xffff) maps.gidToUni.set(gid, String.fromCharCode(cp));
-      else { const v = cp - 0x10000; maps.gidToUni.set(gid, String.fromCharCode(0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff))); }
-    }
-  };
+  // (code, glyph) pairs of one subtable, stored in the loop body below (no local helper: keeps the
+  // "first code point wins" order intact when the runtime makes helpers async)
+  const pc: number[] = [], pg: number[] = [];
   for (let i = 0; i < n && i < 32; i++) {
     const rec = cmapOff + 4 + i * 8;
     if (rec + 8 > data.length) break;
@@ -1354,13 +2065,10 @@ function parseTrueTypeCmap(data: Uint8Array): TtMaps | null {
     const isMac = pid === 1 && eid === 0;
     if (!isUni && !isSym && !isMac) continue;
     const format = u16(sub);
-    const put = (code: number, gid: number): void => {
-      if (isUni) { addUni(code, gid); maps.hasUni = true; }
-      else if (isSym) { if (!maps.codeToGid.has(code & 0xff)) maps.codeToGid.set(code & 0xff, gid); }
-      else if (isMac) { if (!maps.codeToGid.has(code)) maps.codeToGid.set(code, gid); }
-    };
+    pc.length = 0;
+    pg.length = 0;
     if (format === 0) {
-      for (let c = 0; c < 256; c++) put(c, data[sub + 6 + c]);
+      for (let c = 0; c < 256; c++) { pc.push(c); pg.push(data[sub + 6 + c]); }
     } else if (format === 4) {
       const segX2 = u16(sub + 6);
       const endP = sub + 14, startP = endP + segX2 + 2, deltaP = startP + segX2, rangeP = deltaP + segX2;
@@ -1376,20 +2084,29 @@ function parseTrueTypeCmap(data: Uint8Array): TtMaps | null {
             gid = u16(gp);
             if (gid !== 0) gid = (gid + delta) & 0xffff;
           }
-          put(c, gid);
+          pc.push(c);
+          pg.push(gid);
         }
       }
     } else if (format === 6) {
       const first = u16(sub + 6), cnt = u16(sub + 8);
-      for (let k = 0; k < cnt; k++) put(first + k, u16(sub + 10 + k * 2));
+      for (let k = 0; k < cnt; k++) { pc.push(first + k); pg.push(u16(sub + 10 + k * 2)); }
     } else if (format === 12) {
       const nGroups = u32(sub + 12);
-      for (let g = 0; g < nGroups && g < 100000; g++) {
+      for (let g = 0; g < nGroups && g < 100000 && pc.length < 300000; g++) {
         const gp = sub + 16 + g * 12;
         if (gp + 12 > data.length) break;
         const sc = u32(gp), ec = u32(gp + 4), sg = u32(gp + 8);
-        for (let c = sc; c <= ec && c - sc < 65536; c++) put(c, sg + (c - sc));
+        for (let c = sc; c <= ec && c - sc < 65536; c++) { pc.push(c); pg.push(sg + (c - sc)); }
       }
+    }
+    for (let q = 0; q < pc.length; q++) {
+      const code = pc[q], gid = pg[q];
+      if (isUni) {
+        maps.hasUni = true;
+        if (gid !== 0 && !maps.gidToUni.has(gid)) maps.gidToUni.set(gid, code);
+      } else if (isSym) { if (!maps.codeToGid.has(code & 0xff)) maps.codeToGid.set(code & 0xff, gid); }
+      else if (isMac) { if (!maps.codeToGid.has(code)) maps.codeToGid.set(code, gid); }
     }
   }
   return maps;
@@ -1412,6 +2129,7 @@ interface FontInfo {
   tt: TtMaps | null;             // embedded TrueType cmap (fallback mapping)
   cidToGid: Uint8Array | null;   // CIDToGIDMap stream (uint16 BE), null = identity
   spaceWidth: number;
+  ocrFont: boolean;              // font name typical for OCR text layers (Tesseract "GlyphLessFont")
 }
 
 interface Glyph { code: number; u: string; w: number; isSpace: boolean }
@@ -1466,6 +2184,7 @@ class FontLoader {
       tt: null,
       cidToGid: null,
       spaceWidth: 250,
+      ocrFont: /GlyphLess/i.test(doc.nameOf(d.m.get("BaseFont"))),
     };
     // ToUnicode
     const tu = doc.resolve(d.m.get("ToUnicode"));
@@ -1485,6 +2204,8 @@ class FontLoader {
         // predefined (CJK) CMaps are not embedded; we can only use ToUnicode
         if (enc.v.indexOf("UCS2") >= 0 || enc.v.indexOf("UTF16") >= 0) f.ranges = [{ nBytes: 2, lo: 0, hi: 0xffff }];
       }
+      // Identity-H/V codes are always 2 bytes, whatever codespace the ToUnicode CMap declares (R6)
+      if (isName(enc) && enc.v.indexOf("Identity") === 0) f.ranges = [{ nBytes: 2, lo: 0, hi: 0xffff }];
       if (f.ranges.length === 0 && f.toUni && f.toUni.ranges.length > 0) f.ranges = f.toUni.ranges.slice(0);
       if (f.ranges.length === 0) f.ranges = [{ nBytes: 2, lo: 0, hi: 0xffff }];
       f.defaultWidth = cid ? doc.num(cid.m.get("DW"), 1000) : 1000;
@@ -1597,7 +2318,7 @@ class FontLoader {
           if (u === "" && f.tt) {
             let gid = f.tt.codeToGid.get(code);
             if (gid === undefined) gid = f.tt.codeToGid.get(0xf000 | code);
-            if (gid !== undefined) { const g = f.tt.gidToUni.get(gid); if (g !== undefined) u = g; }
+            if (gid !== undefined) { const g = f.tt.gidToUni.get(gid); if (g !== undefined) u = g <= 0xffff ? String.fromCharCode(g) : String.fromCharCode(0xd800 + ((g - 0x10000) >> 10), 0xdc00 + ((g - 0x10000) & 0x3ff)); }
           }
           if (u === "" && code >= 32) u = ENC_WINANSI[code] ? String.fromCharCode(ENC_WINANSI[code]) : "";
         }
@@ -1630,7 +2351,7 @@ class FontLoader {
         let gid = cid;
         if (f.cidToGid && cid * 2 + 1 < f.cidToGid.length) gid = (f.cidToGid[cid * 2] << 8) | f.cidToGid[cid * 2 + 1];
         const g = f.tt.gidToUni.get(gid);
-        if (g !== undefined) u = g;
+        if (g !== undefined) u = g <= 0xffff ? String.fromCharCode(g) : String.fromCharCode(0xd800 + ((g - 0x10000) >> 10), 0xdc00 + ((g - 0x10000) & 0x3ff));
       }
       if (u === null) u = "";
       out.push({ code: code, u: u, w: this.cidWidth(f, cid), isSpace: n === 1 && code === 32 });
@@ -1642,6 +2363,7 @@ class FontLoader {
 // ---------------------------------------------------------------------
 // Content stream interpreter -> positioned text items
 // ---------------------------------------------------------------------
+// flip: kept for compatibility, always false (item y is in y-up user space, see R4)
 interface TextItem { x: number; y: number; w: number; h: number; s: string; sp: number; page: number; flip: boolean; rot: number }
 
 type Mat = [number, number, number, number, number, number];
@@ -1657,8 +2379,31 @@ function matMul(m1: Mat, m2: Mat): Mat {
   ];
 }
 
-interface GState { ctm: Mat; font: FontInfo | null; size: number; charSp: number; wordSp: number; hscale: number; leading: number; rise: number }
+// tr: text render mode (3 and 7 = invisible); fa / sa: fill / stroke alpha (ExtGState ca / CA);
+// mask / blend: an ExtGState soft mask or a non-normal blend mode is active
+interface GState { ctm: Mat; font: FontInfo | null; size: number; charSp: number; wordSp: number; hscale: number; leading: number; rise: number; tr: number; fa: number; sa: number; mask: boolean; blend: boolean }
 
+function copyGState(g: GState): GState {
+  return { ctm: g.ctm, font: g.font, size: g.size, charSp: g.charSp, wordSp: g.wordSp, hscale: g.hscale, leading: g.leading, rise: g.rise, tr: g.tr, fa: g.fa, sa: g.sa, mask: g.mask, blend: g.blend };
+}
+
+function newGState(ctm: Mat): GState {
+  return { ctm: ctm, font: null, size: 0, charSp: 0, wordSp: 0, hscale: 1, leading: 0, rise: 0, tr: 0, fa: 1, sa: 1, mask: false, blend: false };
+}
+
+// text that paints nothing: render mode 3/7, or zero alpha for the parts the mode paints
+// (Apple's Vision OCR layer uses an ExtGState with /ca 0 instead of 3 Tr)
+function invisibleText(gs: GState): boolean {
+  const tr = gs.tr;
+  if (tr === 3 || tr === 7) return true;
+  const fill = tr === 0 || tr === 2 || tr === 4 || tr === 6, stroke = tr === 1 || tr === 2 || tr === 5 || tr === 6;
+  return (!fill || gs.fa < 0.01) && (!stroke || gs.sa < 0.01);
+}
+
+// Extraction statistics: glyph counts for the OCR and Unicode checks.
+// glyphsOcr: invisible (Tr 3/7) or OCR-font glyphs; glyphsCovered: visible glyphs later painted over
+// by a page-filling opaque image ("text under image" OCR); glyphsOnImagePages: other visible glyphs
+// on pages with a page-filling image; glyphsNoUni: glyphs without a Unicode mapping.
 class ContentInterpreter {
   doc: PdfDoc;
   items: TextItem[];
@@ -1666,6 +2411,17 @@ class ContentInterpreter {
   formDepth: number;
   ops: number;
   deadline: number;
+  glyphsTotal: number;
+  glyphsOcr: number;
+  glyphsCovered: number;
+  glyphsOnImagePages: number;
+  glyphsNoUni: number;
+  pageNative: number;
+  pageArea: number;
+  pageHasImage: boolean;
+  pagesWithImage: number;
+  ocHidden: number;
+  box: number[];
 
   constructor(doc: PdfDoc) {
     this.doc = doc;
@@ -1674,11 +2430,37 @@ class ContentInterpreter {
     this.formDepth = 0;
     this.ops = 0;
     this.deadline = runDeadline; // one budget for the whole run, set in main
+    this.glyphsTotal = 0;
+    this.glyphsOcr = 0;
+    this.glyphsCovered = 0;
+    this.glyphsOnImagePages = 0;
+    this.glyphsNoUni = 0;
+    this.pageNative = 0;
+    this.pageArea = 0;
+    this.pageHasImage = false;
+    this.pagesWithImage = 0;
+    this.ocHidden = 0;
+    this.box = [];
+  }
+
+  beginPage(box: number[]): void {
+    this.box = box;
+    this.pageArea = Math.abs((box[2] - box[0]) * (box[3] - box[1]));
+    this.pageNative = 0;
+    this.pageHasImage = false;
+    this.ocHidden = 0;
+  }
+
+  endPage(): void {
+    if (this.pageHasImage) {
+      this.glyphsOnImagePages += this.pageNative;
+      this.pagesWithImage++;
+    }
+    this.pageNative = 0;
   }
 
   runPage(content: string, resources: PDict | null, page: number): void {
-    const gs: GState = { ctm: [1, 0, 0, 1, 0, 0], font: null, size: 0, charSp: 0, wordSp: 0, hscale: 1, leading: 0, rise: 0 };
-    this.run(content, resources, gs, page, new Set<number>());
+    this.run(content, resources, newGState([1, 0, 0, 1, 0, 0]), page, new Set<number>());
   }
 
   runAnnotations(pageDict: PDict, resources: PDict | null, page: number): void {
@@ -1691,7 +2473,8 @@ class ContentInterpreter {
       const sub = doc.nameOf(ad.m.get("Subtype"));
       if (sub === "Link" || sub === "Popup") continue;
       const flags = doc.num(ad.m.get("F"), 0);
-      if (flags & 2) continue; // hidden
+      if (flags & 34) continue; // Hidden (2) or NoView (32)
+      if (doc.isHiddenOC(ad.m.get("OC"))) continue;
       const ap = doc.dictOf(ad.m.get("AP"));
       if (!ap) continue;
       let n = doc.resolve(ap.m.get("N"));
@@ -1701,6 +2484,7 @@ class ContentInterpreter {
         n = doc.resolve(pick);
       }
       if (!isStream(n)) continue;
+      if (doc.isHiddenOC(n.d.m.get("OC"))) continue;
       const rect = doc.numArr(ad.m.get("Rect"), 0);
       const bbox = doc.numArr(n.d.m.get("BBox"), 0);
       let ctm: Mat = [1, 0, 0, 1, 0, 0];
@@ -1715,9 +2499,8 @@ class ContentInterpreter {
         const sx = maxX - minX > 1e-6 ? (rx1 - rx0) / (maxX - minX) : 1, sy = maxY - minY > 1e-6 ? (ry1 - ry0) / (maxY - minY) : 1;
         ctm = matMul(ctm, [sx, 0, 0, sy, rx0 - minX * sx, ry0 - minY * sy]);
       }
-      const gs: GState = { ctm: ctm, font: null, size: 0, charSp: 0, wordSp: 0, hscale: 1, leading: 0, rise: 0 };
       const res = doc.dictOf(n.d.m.get("Resources")) || resources;
-      try { this.run(doc.streamText(n), res, gs, page, new Set<number>([n.id])); } catch (e) { doc.warnings.push("annotation: " + String(e)); }
+      try { this.run(doc.streamText(n), res, newGState(ctm), page, new Set<number>([n.id])); } catch (e) { doc.warnings.push("annotation: " + String(e)); }
     }
   }
 
@@ -1733,21 +2516,60 @@ class ContentInterpreter {
     const scale = Math.sqrt(trm[0] * trm[0] + trm[1] * trm[1]) / Math.max(gs.size * gs.hscale, 1e-9);
     let text = "";
     let advance = 0; // text space units (before hscale)
+    let noUni = 0;
     for (const g of glyphs) {
-      const w0 = f.type3 ? g.w / 1000 : g.w / 1000;
+      const w0 = g.w / 1000;
       let tx = w0 * gs.size + gs.charSp;
       if (g.isSpace) tx += gs.wordSp;
       advance += tx;
       text += g.u;
+      const c0 = g.u.length > 0 ? g.u.charCodeAt(0) : 0;
+      if (c0 === 0 || c0 === 0xfffd || (c0 >= 0xe000 && c0 <= 0xf8ff)) noUni++;
     }
     const devW = advance * gs.hscale * scale;
     const devH = Math.abs(gs.size * Math.sqrt(trm[2] * trm[2] + trm[3] * trm[3]) / Math.max(gs.size, 1e-9));
-    if (text.length > 0) {
+    if (this.ocHidden === 0 && glyphs.length > 0) {
+      // statistics for the OCR / Unicode checks (text in hidden optional content does not count)
+      this.glyphsTotal += glyphs.length;
+      this.glyphsNoUni += noUni;
+      if (f.ocrFont || invisibleText(gs)) this.glyphsOcr += glyphs.length;
+      else this.pageNative += glyphs.length;
+    }
+    if (text.length > 0 && this.ocHidden === 0) {
       let rot = Math.round(Math.atan2(trm[1], trm[0]) / (Math.PI / 2)) % 4;
       if (rot < 0) rot += 4;
-      this.items.push({ x: trm[4], y: trm[5], w: devW, h: devH > 0 ? devH : Math.abs(gs.size * scale), s: text, sp: (f.spaceWidth / 1000) * gs.size * gs.hscale * scale, page: page, flip: trm[3] < 0, rot: rot });
+      this.items.push({ x: trm[4], y: trm[5], w: devW, h: devH > 0 ? devH : Math.abs(gs.size * scale), s: text, sp: (f.spaceWidth / 1000) * gs.size * gs.hscale * scale, page: page, flip: false, rot: rot });
     }
     return matMul([1, 0, 0, 1, advance * gs.hscale, 0], tm);
+  }
+
+  private paintImage(gs: GState, img: PDict | null): void {
+    // a page-filling opaque image: text drawn before it on this page is hidden under the image
+    if (gs.fa < 0.99 || gs.mask || gs.blend || this.pageArea <= 0) return;
+    if (img && (img.m.has("SMask") || img.m.has("Mask") || this.doc.resolve(img.m.get("ImageMask")) === true)) return;
+    const m = gs.ctm;
+    const area = Math.abs(m[0] * m[3] - m[1] * m[2]);
+    if (area < 0.5 * this.pageArea) return;
+    this.pageHasImage = true;
+    this.glyphsCovered += this.pageNative;
+    this.pageNative = 0;
+  }
+
+  private extGState(gs: GState, resources: PDict | null, name: PObj): void {
+    // transparency from an ExtGState (fill alpha, soft mask, blend mode)
+    if (!isName(name) || !resources) return;
+    const doc = this.doc;
+    const egs = doc.dictOf(resources.m.get("ExtGState"));
+    const d = egs ? doc.dictOf(egs.m.get(name.v)) : null;
+    if (!d) return;
+    if (d.m.has("ca")) gs.fa = doc.num(d.m.get("ca"), 1);
+    if (d.m.has("CA")) gs.sa = doc.num(d.m.get("CA"), 1);
+    const sm = d.m.get("SMask");
+    if (sm !== undefined) gs.mask = doc.nameOf(sm) !== "None";
+    if (d.m.has("BM")) {
+      const bm = doc.nameOf(d.m.get("BM"));
+      gs.blend = bm !== "" && bm !== "Normal" && bm !== "Compatible";
+    }
   }
 
   private run(content: string, resources: PDict | null, gsIn: GState, page: number, visited: Set<number>): void {
@@ -1755,6 +2577,7 @@ class ContentInterpreter {
     const lx = new Lexer(content, 0);
     const stack: PObj[] = [];
     const gsStack: GState[] = [];
+    const mcStack: boolean[] = []; // marked content: true = hidden optional content
     let gs: GState = gsIn;
     let tm: Mat = [1, 0, 0, 1, 0, 0];
     let tlm: Mat = [1, 0, 0, 1, 0, 0];
@@ -1763,19 +2586,24 @@ class ContentInterpreter {
 
     let guard = 0;
     for (;;) {
-      if (++guard > 5000000) break;
-      if ((guard & 4095) === 0 && Date.now() > this.deadline) { doc.warnings.push("time budget exhausted, text truncated"); break; }
+      if (++guard > 5000000) { doc.flagIncomplete("operator limit reached"); break; }
+      if ((guard & 4095) === 0 && Date.now() > this.deadline) {
+        doc.warnings.push("time budget exhausted, text truncated");
+        doc.flagIncomplete("time budget exhausted");
+        break;
+      }
       let o: PObj | null;
-      try { o = lx.parse(0); } catch (e) { break; }
+      try { o = lx.parse(0); } catch (e) { doc.flagIncomplete("content stream could not be parsed"); break; }
       if (o === null) { if (lx.pos >= content.length) break; stack.push(null); continue; }
       if (!isKw(o)) { stack.push(o); if (stack.length > 64) stack.shift(); continue; }
       const op = o.v;
       this.ops++;
-      const n = (i: number): number => { const v = stack[stack.length - i]; return isNum(v) ? v : 0; };
+      const n = (i: number): number => { const v = stack[stack.length - i]; return typeof v === "number" ? v : 0; };
       switch (op) {
-        case "q": gsStack.push({ ctm: gs.ctm, font: gs.font, size: gs.size, charSp: gs.charSp, wordSp: gs.wordSp, hscale: gs.hscale, leading: gs.leading, rise: gs.rise }); if (gsStack.length > 256) gsStack.shift(); break;
+        case "q": gsStack.push(copyGState(gs)); if (gsStack.length > 256) gsStack.shift(); break;
         case "Q": { const p = gsStack.pop(); if (p) gs = p; break; }
         case "cm": if (stack.length >= 6) gs.ctm = matMul([n(6), n(5), n(4), n(3), n(2), n(1)], gs.ctm); break;
+        case "gs": this.extGState(gs, resources, stack[stack.length - 1]); break;
         case "BT": tm = [1, 0, 0, 1, 0, 0]; tlm = [1, 0, 0, 1, 0, 0]; break;
         case "ET": break;
         case "Tf": {
@@ -1796,6 +2624,7 @@ class ContentInterpreter {
         case "Tw": gs.wordSp = n(1); break;
         case "Tz": gs.hscale = n(1) / 100; break;
         case "Ts": gs.rise = n(1); break;
+        case "Tr": gs.tr = n(1); break;
         case "Tj": { const s = stack[stack.length - 1]; if (isStr(s)) tm = this.showText(gs, tm, s.v, page); break; }
         case "'": { tlm = matMul([1, 0, 0, 1, 0, -gs.leading], tlm); tm = tlm; const s = stack[stack.length - 1]; if (isStr(s)) tm = this.showText(gs, tm, s.v, page); break; }
         case "\"": { gs.wordSp = n(3); gs.charSp = n(2); tlm = matMul([1, 0, 0, 1, 0, -gs.leading], tlm); tm = tlm; const s = stack[stack.length - 1]; if (isStr(s)) tm = this.showText(gs, tm, s.v, page); break; }
@@ -1809,20 +2638,42 @@ class ContentInterpreter {
           }
           break;
         }
+        case "BMC": mcStack.push(false); break;
+        case "BDC": {
+          let hidden = false;
+          const tag = stack[stack.length - 2];
+          if (isName(tag) && tag.v === "OC") {
+            const prop = stack[stack.length - 1];
+            if (isName(prop)) {
+              const props = resources ? doc.dictOf(resources.m.get("Properties")) : null;
+              hidden = props ? doc.isHiddenOC(props.m.get(prop.v)) : false;
+            } else if (isDict(prop)) hidden = doc.isHiddenOC(prop);
+          }
+          mcStack.push(hidden);
+          if (hidden) this.ocHidden++;
+          break;
+        }
+        case "EMC": { const h = mcStack.pop(); if (h === true) this.ocHidden--; break; }
         case "Do": {
           const nm = stack[stack.length - 1];
-          if (isName(nm) && xobjDict && this.formDepth < 12) {
-            const ref = xobjDict.m.get(nm.v);
-            const xo = doc.resolve(ref);
-            if (isStream(xo) && doc.nameOf(xo.d.m.get("Subtype")) === "Form" && !visited.has(xo.id)) {
+          if (isName(nm) && xobjDict) {
+            const xo = doc.resolve(xobjDict.m.get(nm.v));
+            if (!isStream(xo) || doc.isHiddenOC(xo.d.m.get("OC"))) break;
+            const subtype = doc.nameOf(xo.d.m.get("Subtype"));
+            if (subtype === "Image") {
+              if (this.ocHidden === 0) this.paintImage(gs, xo.d);
+            } else if (subtype === "Form" && !visited.has(xo.id)) {
+              if (this.formDepth >= 12) { doc.flagIncomplete("form XObjects nested too deeply"); break; }
+              // many small forms calling each other never reach the per-stream check below
+              if (Date.now() > this.deadline) { doc.flagIncomplete("time budget exhausted"); break; }
               visited.add(xo.id);
               this.formDepth++;
               const saved = gs;
-              const sub: GState = { ctm: gs.ctm, font: gs.font, size: gs.size, charSp: gs.charSp, wordSp: gs.wordSp, hscale: gs.hscale, leading: gs.leading, rise: gs.rise };
+              const sub = copyGState(gs);
               const mtx = doc.arrOf(xo.d.m.get("Matrix"));
               if (mtx.length === 6) sub.ctm = matMul([doc.num(mtx[0], 1), doc.num(mtx[1], 0), doc.num(mtx[2], 0), doc.num(mtx[3], 1), doc.num(mtx[4], 0), doc.num(mtx[5], 0)], sub.ctm);
               const res = doc.dictOf(xo.d.m.get("Resources")) || resources;
-              try { this.run(doc.streamText(xo), res, sub, page, visited); } catch (e) { doc.warnings.push("XObject " + nm.v + ": " + String(e)); }
+              try { this.run(doc.streamText(xo), res, sub, page, visited); } catch (e) { doc.warnings.push("XObject " + nm.v + ": " + String(e)); doc.flagIncomplete("form XObject " + nm.v + " could not be read"); }
               gs = saved;
               this.formDepth--;
               visited.delete(xo.id);
@@ -1836,6 +2687,7 @@ class ContentInterpreter {
           let p = lx.pos;
           const idIdx = s.indexOf("ID", p);
           if (idIdx < 0) { lx.pos = s.length; break; }
+          if (this.ocHidden === 0 && !/\/(IM|ImageMask)\s+true/.test(s.substring(p, idIdx))) this.paintImage(gs, null);
           p = idIdx + 3;
           for (;;) {
             const ei = s.indexOf("EI", p);
@@ -1851,7 +2703,105 @@ class ContentInterpreter {
       }
       stack.length = 0;
     }
+    if (lx.unterminated) doc.flagIncomplete("unterminated string in a content stream");
+    // unbalanced BDC inside this stream must not hide text outside it
+    for (const h of mcStack) if (h) this.ocHidden--;
   }
+
+  private deskew(): void {
+    // Skewed scans with an OCR layer: estimate the page's text angle from consecutive items in
+    // stream order (words of one line) and rotate the positions back. Native text gives 0.
+    const byPage = new Map<number, number[]>();
+    const items = this.items;
+    for (let i = 0; i + 1 < items.length; i++) {
+      const a = items[i], b = items[i + 1];
+      if (a.page !== b.page || a.rot !== 0 || b.rot !== 0) continue;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      if (dx <= Math.max(a.h, 1) || Math.abs(dy) > dx * 0.0875) continue; // within 5 degrees
+      let list = byPage.get(a.page);
+      if (!list) { list = []; byPage.set(a.page, list); }
+      list.push(Math.atan2(dy, dx));
+    }
+    for (const [page, angles] of Array.from(byPage.entries())) {
+      if (angles.length < 4) continue;
+      angles.sort((p, q) => p - q);
+      const med = angles[angles.length >> 1];
+      if (Math.abs(med) < 0.0017) continue; // < 0.1 degree
+      // native text: many neighbours share the exact same baseline; a skewed scan has (almost) none
+      let flat = 0;
+      for (const ang of angles) if (Math.abs(ang) < 0.0001) flat++;
+      if (flat * 4 >= angles.length) continue;
+      const c = Math.cos(med), sn = Math.sin(med);
+      for (const it of items) {
+        if (it.page !== page || it.rot !== 0) continue;
+        const x = it.x, y = it.y;
+        it.x = x * c + y * sn;
+        it.y = -x * sn + y * c;
+      }
+    }
+  }
+
+  finishItems(boxes: number[][]): TextItem[] {
+    // Drops text outside the page box (when most of the page's text is inside it), straightens
+    // skewed OCR pages and drops text drawn twice at (almost) the same place (same string,
+    // > 50 % overlap along the line). boxes[i] is the box of page i.
+    this.items = dropOffPage(this.items, boxes);
+    this.deskew();
+    const out: TextItem[] = [];
+    const buckets = new Map<string, TextItem[]>();
+    for (const it of this.items) {
+      // coordinates along (u) and across (v) the text direction
+      const u = it.rot === 0 ? it.x : it.rot === 1 ? it.y : it.rot === 2 ? -it.x : -it.y;
+      const v = it.rot === 0 ? it.y : it.rot === 1 ? -it.x : it.rot === 2 ? -it.y : it.x;
+      const b = Math.floor(v / 4);
+      let dup = false;
+      for (let k = b - 1; k <= b + 1 && !dup; k++) {
+        const list = buckets.get(it.page + "|" + it.rot + "|" + k + "|" + it.s);
+        if (!list) continue;
+        for (const o of list) {
+          const ou = o.rot === 0 ? o.x : o.rot === 1 ? o.y : o.rot === 2 ? -o.x : -o.y;
+          const ov = o.rot === 0 ? o.y : o.rot === 1 ? -o.x : o.rot === 2 ? -o.y : o.x;
+          const h = Math.max(it.h, o.h, 1);
+          if (Math.abs(ov - v) > 0.5 * h) continue;
+          const minW = Math.min(it.w, o.w);
+          if (minW < 0.01) { if (Math.abs(ou - u) < 0.15 * h) { dup = true; break; } continue; }
+          const overlap = Math.min(u + it.w, ou + o.w) - Math.max(u, ou);
+          if (overlap > 0.5 * minW) { dup = true; break; }
+        }
+      }
+      if (dup) continue;
+      const key = it.page + "|" + it.rot + "|" + b + "|" + it.s;
+      let own = buckets.get(key);
+      if (!own) { own = []; buckets.set(key, own); }
+      own.push(it);
+      out.push(it);
+    }
+    return out;
+  }
+}
+
+// Drops items outside their page box (+ margin) when most items of that page are inside;
+// boxes[i] belongs to page i.
+function dropOffPage(items: TextItem[], boxes: number[][]): TextItem[] {
+  const inside = new Map<number, number>(), outside = new Map<number, number>();
+  const flags: boolean[] = [];
+  for (const it of items) {
+    const b = boxes[it.page];
+    let ok = true;
+    if (b && b.length === 4 && b[2] - b[0] > 1 && b[3] - b[1] > 1) {
+      const m = 10;
+      ok = it.x >= b[0] - m && it.x <= b[2] + m && it.y >= b[1] - m && it.y <= b[3] + m;
+    }
+    flags.push(ok);
+    const map = ok ? inside : outside;
+    map.set(it.page, (map.get(it.page) || 0) + 1);
+  }
+  const out: TextItem[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const p = items[i].page;
+    if (flags[i] || (inside.get(p) || 0) < (outside.get(p) || 0)) out.push(items[i]);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -1930,31 +2880,150 @@ function assembleLines(items: TextItem[]): string[] {
         prevText = t;
         prevX = it.x;
       }
-      line = line.replace(/\s+$/, "");
+      // trailing white space, without a regex (/\s+$/ is quadratic on long runs of inner spaces)
+      let e = line.length;
+      while (e > 0 && /\s/.test(line.charAt(e - 1))) e--;
+      if (e < line.length) line = line.substring(0, e);
       if (line.length > 0) lines.push(line);
     }
   }
   return lines;
 }
 
+
 // ---------------------------------------------------------------------
 // Amount extraction
 // ---------------------------------------------------------------------
-interface Candidate { amount: string; value: number; score: number; line: string; lineIdx: number; method: string }
+// One amount found in a line: printed text, value and position.
+interface AmountMatch { text: string; value: number; index: number; end: number }
 
-const STRONG_KEYWORDS = /gesamt|zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|gutschriftsbetrag|endbetrag|endsumme|summe|total|nettobetrag der zahlung|betrag der überweisung|wir überweisen|überwiesen|zahlung in höhe|zahlen wir|angewiesen|remittance total|amount paid|payment amount|net amount paid/i;
+// Keyword classes of the label that belongs to one amount.
+interface LabelInfo { strong: boolean; payment: boolean; weak: boolean; neg: boolean; ded: boolean }
+
+interface Candidate {
+  amount: string; value: number; score: number; line: string; lineIdx: number; method: string;
+  pos: number;          // index of the amount within its line, -1 for keyword-next-line
+  charIdx: number;      // position of the amount text in its line
+  label: LabelInfo;     // own label segment, or the line label for table cells
+  lineLabel: boolean;   // amount carries the line's first label (table cell / total row)
+  ownLabel: boolean;    // amount has its own text label (not a bare table cell)
+  confirmed: boolean;   // backed by arithmetic (column sum, sum check, deduction chain)
+  copy: boolean;        // inside an appended invoice copy
+  risky: boolean;       // table whose rightmost amount column is Skonto / Rest / Offen
+  col: string;          // column class from the table header ("" = unmapped)
+}
+
+interface LineInfo {
+  text: string;
+  amounts: AmountMatch[];
+  labels: LabelInfo[];
+  lineLabel: boolean[];
+  own: boolean[];
+  cols: string[];
+  pcts: number[];       // percentages written in the line ("2 % Skonto")
+  label: LabelInfo;     // keyword classes of the whole line
+  header: boolean;
+  risky: boolean;
+  payBonus: boolean;    // header-mapped payment column counts as a label on this line
+  copy: boolean;
+  wrapped: string;      // label wrapped around a value-only line ("" if none)
+  grossPay: boolean;    // single invoice row under a Netto/USt/Brutto header without payment or deduction column
+  payCol: boolean;      // row under a header that has a payment column (Zahlbetrag)
+}
+
+interface AmountPick { best: Candidate | null; candidates: Candidate[]; currency: string; confidence: string; reason: string }
+
+const STRONG_KEYWORDS = /gesamt|zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|gutschriftsbetrag|endbetrag|endsumme|summe|total|nettobetrag der zahlung|betrag der überweisung|wir überweisen|überwiesen|ueberwiesen|überweisen wir|überweisen ihnen|zahlung in höhe|zahlen wir|wir zahlen|zu zahlen|angewiesen|den betrag von|gutgeschrieben|zu ihren gunsten|betrag der zahlung|überweisung\b|ueberweisung\b|ausgleichsbetrag|gezahlte[rn]? betrag|bezahlte[rn]? betrag|nettozahlung|gutschrift auf ihr konto|remittance total|remittance amount|amount remitted|amount paid|payment amount|net amount paid|net payment|total paid|payment total|check amount|credited amount|amount credited/i;
 // words that mean "what was actually paid" – beat generic totals like "Summe Rechnungsbetrag"
-const PAYMENT_KEYWORDS = /zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlung|gutschriftsbetrag|wir überweisen|überwiesen|zahlung in höhe|zahlen wir|angewiesen|amount paid|payment amount|net amount paid|remittance total/i;
-const WEAK_KEYWORDS = /betrag|zahlung|überweisung|ueberweisung|amount|payment|eur|€/i;
-const NEGATIVE_KEYWORDS = /skonto|abzug|rabatt|steuer|mwst|ust\b|vat|rechnungsbetrag|rechnungssumme|bruttobetrag|brutto|netto\b|offener|offene|restbetrag|fällig|iban|bic|datum|belegnr|beleg-?nr|rechnungsnr|rechnungs-?nummer|kundennr|kunden-?nummer|lieferantennr|seite|page|telefon|tel\.|fax|steuernummer|ust-id|konto\b|blz|zwischensumme|zinsen|mahn/i;
+const PAYMENT_KEYWORDS = /zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlung|gutschriftsbetrag|wir überweisen|überwiesen|ueberwiesen|überweisen wir|überweisen ihnen|zahlung in höhe|zahlen wir|wir zahlen|zu zahlen|angewiesen|den betrag von|gutgeschrieben|zu ihren gunsten|betrag der zahlung|überweisung\b|ueberweisung\b|zahlungssumme|ausgleichsbetrag|gezahlte[rn]? betrag|bezahlte[rn]? betrag|nettozahlung|gutschrift auf ihr konto|remittance total|remittance amount|amount remitted|amount paid|payment amount|net amount paid|net payment|total paid|payment total|check amount|credited amount|amount credited/i;
+// payment verbs that follow the amount in a sentence ("3.454,00 EUR überwiesen")
+const POST_PAYMENT = /überwiesen|ueberwiesen|überweisen|gutgeschrieben|angewiesen|bezahlt|beglichen|ausgeglichen|transferred|remitted|paid\b/i;
+// label nouns that must be followed by an amount (safety net)
+const PAYMENT_LABEL = /zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|gutschriftsbetrag|zahlungssumme|betrag der zahlung|payment amount|amount paid|net payment|total paid|credited amount|amount credited/i;
+// running totals and balances are no payment, even when worded like one ("Saldo zu Ihren Gunsten", "bisher überwiesen")
+const CUMULATIVE = /(?:saldo|guthaben|kontostand)[^.]{0,25}zu ihren gunsten|\bbisher\b/i;
+const YEAR_TO_DATE = /year to date|\bytd\b|laufenden jahr|kumuliert/i;
+const WEAK_KEYWORDS = /betrag|zahlung|überweisung|ueberweisung|amount|payment/i;
+const NEGATIVE_KEYWORDS = /skonto|abzug|abzgl|abzüglich|\.\/\.|einbehalt|gebühr|spesen|rabatt|discount|steuer|mwst|ust\b|vat\b|rechnungsbetrag|rechnungssumme|bruttobetrag|brutto|netto\b|offener|offene|restbetrag|fällig|iban|bic\b|datum|belegnr|beleg-?nr|rechnungsnr|rechnungs-?nummer|kundennr|kunden-?nummer|lieferantennr|seite|page|telefon|tel\.|fax|steuernummer|ust-id|blz|zwischensumme|subtotal|zinsen|mahn|kontostand|saldo|kapital|capital|kreditlimit|guthaben|kurs\b|umrechnung|exchange rate|gross amount|invoice amount|total invoice|instructed amount|charges|gewicht|menge/i;
+// deduction labels for the total - deduction = payment chain
+const DEDUCTION_KEYWORDS = /skonto|abzug|abzgl|abzüglich|\.\/\.|einbehalt|gebühr|spesen|rabatt|discount|kürzung|minderung|verrechn|gutschrift(?!sbetrag|sanzeige| auf)|credit note|less\b|charges/i;
+const UNIT_AFTER = /^\s?(?:kg|g|t|to|st|stk|stck|stück|pal|paletten|m|m2|m3|qm|cbm|l|ltr|liter|km|std|min|%|prozent|pct|pcs|pc|ea|lbs?)(?![A-Za-zÄÖÜäöüß0-9])/i;
+const UNIT_AFTER_H = /^\s?h(?![A-Za-zÄÖÜäöüß0-9])/; // hours, lower case only
+const NUMBER_LABEL_BEFORE = /(?:nr|no|rg|re|rechnung|pos|position|beleg|invoice|inv|art|artikel|kd|kunde|anzahl|menge|stk|stück|#)\.?:?\s*$/i;
+const CURRENCY_TOKEN = /\b(?:EUR|CHF|USD|GBP|PLN|CZK|SEK|DKK|NOK|HUF|RON|BGN|JPY|CNY|CAD|AUD|TRY)\b|€|\$|£|¥|zł|Kč|\b[Ee][Uu][Rr][Oo]\b|\bSFr\b|\bFr\.(?= ?\d)/g;
+const PAYMENT_MARKER = /zahlung|zahlbetrag|\bzahlen|gezahlt|bezahlt|überw|ueberw|gutschrift|gutgeschrieben|ausgleich|beglichen|begleichen|skonto|payment|remittance|\bpaid\b|remitted|auszahlung|credited|credit advice|incoming payment/i;
+const NON_PAYMENT_MARKER = /lieferschein|lieferavis|versandavis|versandanzeige|avisierung|anlieferung|despatch advice|dispatch advice|delivery note|lastschrift|mandatsreferenz|pre-?notification|einziehen|zahlungserinnerung|\bmahnung|angebot\b|angebotssumme|auftragsbestätigung|auftragsbestaetigung|order confirmation|pro-?forma|abschlagsrechnung|teilrechnung|schlussrechnung|kostenvoranschlag|quotation/i;
+// title of a payment advice: the document checks below trust it
+const AVIS_TITLE = /zahlungsavis|payment advice|remittance advice|zahlungsmitteilung|gutschriftsanzeige/i;
+const INVOICE_HEAD = /^\s*(?:rechnung|rechnungskopie|kopie der rechnung|invoice|faktura)\b/i;
+const VAT_LINE = /zzgl|mwst|ust\b|ust\.|umsatzsteuer|mehrwertsteuer|\bvat\b/i;
+const GROUP_MARK = "\u0001";
 
+// Normalizes one text line: Unicode spaces/ligatures (NFKC), group separators, split amounts, letter spacing.
 function normalizeLine(line: string): string {
-  let s = line.replace(/\u00A0/g, " "); // no-break space
-  // glue thousands separators / decimals that got split by positioning: "3 . 454 , 00" -> "3.454,00"
-  s = s.replace(/(\d)\s*\.\s*(\d{3})(?=[^\d]|$)/g, "$1.$2");
-  s = s.replace(/(\d)\s*,\s*(\d{2})(?=[^\d]|$)/g, "$1,$2");
-  s = s.replace(/(^|[^\d.,])(\d{1,3}) (\d{3})(?=,\d{2}(?!\d))/g, "$1$2.$3"); // thin-space thousands: "3 454,00"
+  // group separators between digits (no-break, thin, narrow, figure spaces, apostrophes) – before NFKC turns them into spaces
+  let s = line.replace(/(\d)[\u00A0\u2007\u2008\u2009\u200A\u202F'\u2019\u02BC\u00B4`](?=\d{3}(?!\d))/g, "$1" + GROUP_MARK);
+  s = s.normalize("NFKC").replace(/\u2212/g, "-").replace(/\t/g, " ");
+  if (s.indexOf(GROUP_MARK) >= 0) {
+    const reG = /\d+(?:\u0001\d{3})+([.,]\d{2}(?!\d))?/g;
+    let out = "", last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = reG.exec(s)) !== null) {
+      const dec = m[1] ? m[1].charAt(0) : "";
+      out += s.substring(last, m.index) + m[0].split(GROUP_MARK).join(dec === "," ? "." : dec === "." ? "," : "");
+      last = m.index + m[0].length;
+    }
+    s = (out + s.substring(last)).split(GROUP_MARK).join(" ");
+  }
+  // "3 . 454 , 00" / "4. 271. 610, 12" -> one German amount; "3 , 454 . 00" -> one English amount
+  s = glueSpaced(s, /\d{1,3}(?: ?\. ?\d{3})+ ?, ?\d{2}(?!\d)/g);
+  s = glueSpaced(s, /\d{1,3}(?: ?, ?\d{3})+ ?\. ?\d{2}(?!\d)/g);
+  // "1234 , 00" (not a date tail like "4711, 15.09.2026")
+  s = s.replace(/(\d) ?, ?(\d{2})(?!\d|[.,]\d)/g, "$1,$2");
+  // space-grouped thousands "3 454,00" / "1 234 567,89" – never glue "Nr. 816 120,00"
+  if (/\d \d{3}[.,]\d{2}/.test(s)) {
+    const reS = /\d{1,3}(?: \d{3})+(?=[.,]\d{2}(?!\d))/g;
+    let out = "", last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = reS.exec(s)) !== null) {
+      const before = m.index > 0 ? s.charAt(m.index - 1) : " ";
+      if (/[\d.,]/.test(before) || NUMBER_LABEL_BEFORE.test(s.substring(Math.max(0, m.index - 14), m.index))) continue;
+      const dec = s.charAt(m.index + m[0].length);
+      out += s.substring(last, m.index) + m[0].split(" ").join(dec === "," ? "." : ",");
+      last = m.index + m[0].length;
+    }
+    s = out + s.substring(last);
+  }
+  // whole-unit notation "1.500,-- EUR"
+  s = s.replace(/(\d),(?:--|-|\u2013|\u2014)(?![\d-])/g, "$1,00");
+  // letter-spaced labels "Ü B E R W E I S U N G S B E T R A G" -> one word
+  if (/(?:[A-Za-zÄÖÜäöüß] ){3}/.test(s)) {
+    const reL = /(?:[A-Za-zÄÖÜäöüß] ){3,}[A-Za-zÄÖÜäöüß](?![A-Za-zÄÖÜäöüß0-9])/g;
+    let out = "", last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = reL.exec(s)) !== null) {
+      if (m.index > 0 && /[A-Za-zÄÖÜäöüß0-9]/.test(s.charAt(m.index - 1))) continue;
+      out += s.substring(last, m.index) + m[0].split(" ").join("");
+      last = m.index + m[0].length;
+    }
+    s = out + s.substring(last);
+  }
   return s;
+}
+
+// Removes single spaces inside matches of re that start at a number boundary.
+function glueSpaced(s: string, re: RegExp): string {
+  if (s.indexOf(" ") < 0) return s;
+  let out = "", last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0].indexOf(" ") < 0) continue;
+    const before = m.index > 0 ? s.charAt(m.index - 1) : " ";
+    if (/[\d.,]/.test(before)) continue;
+    out += s.substring(last, m.index) + m[0].split(" ").join("");
+    last = m.index + m[0].length;
+  }
+  return out + s.substring(last);
 }
 
 function parseGermanAmount(a: string): number {
@@ -1977,8 +3046,20 @@ function parseEnglishAmount(a: string): number {
   return neg ? -v : v;
 }
 
-function findAmountsInLine(line: string, english: boolean): { text: string; value: number; index: number }[] {
-  const out: { text: string; value: number; index: number }[] = [];
+// Number format of the whole document from unambiguous matches (dates and times removed first).
+function detectEnglishFormat(lines: string[]): boolean {
+  let de = 0, en = 0;
+  for (const ln of lines) {
+    if (!/\d[.,]\d/.test(ln)) continue;
+    const t = ln.replace(/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/g, " ").replace(/\b\d{4}-\d{2}-\d{2}\b/g, " ").replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, " ");
+    de += 3 * (t.match(/\d\.\d{3},\d{2}(?!\d)/g) || []).length + (t.match(/\d,\d{2}(?![\d.,])/g) || []).length;
+    en += 3 * (t.match(/\d,\d{3}\.\d{2}(?!\d)/g) || []).length + (t.match(/\d\.\d{2}(?![\d.,])/g) || []).length;
+  }
+  return en > de;
+}
+
+function findAmountsInLine(line: string, english: boolean): AmountMatch[] {
+  const out: AmountMatch[] = [];
   const re = english
     ? /-?\d{1,3}(?:,\d{3})+\.\d{2}-?|-?\d+\.\d{2}-?/g
     : /-?\d{1,3}(?:\.\d{3})+,\d{2}-?|-?\d+,\d{2}-?/g;
@@ -1987,112 +3068,597 @@ function findAmountsInLine(line: string, english: boolean): { text: string; valu
     const start = m.index, end = start + m[0].length;
     const before = start > 0 ? line.charAt(start - 1) : " ";
     const after = end < line.length ? line.charAt(end) : " ";
-    if (/[\d.,]/.test(before) || /[\d]/.test(after)) continue;
-    // skip things that are obviously dates/ids: "01.10.2026" never matches (needs ,dd) – but "10,00" inside "IBAN"? fine
-    const value = english ? parseEnglishAmount(m[0]) : parseGermanAmount(m[0]);
-    if (isNaN(value)) continue;
-    out.push({ text: m[0].replace(/\s/g, ""), value: value, index: start });
+    const after2 = end + 1 < line.length ? line.charAt(end + 1) : " ";
+    if (/[\d.,]/.test(before) || /\d/.test(after)) continue;
+    // garbled number "3.4S4,00" / "1.2O0,00": do not read the tail as an amount
+    if (/[A-Za-z]/.test(before) && start > 1 && /[\d.,]/.test(line.charAt(start - 2))) continue;
+    if ((after === "." || after === ",") && /\d/.test(after2)) continue; // date tail "05.10.2026", "3.454.00"
+    const unit = line.substring(end, end + 12);
+    if (UNIT_AFTER.test(unit) || UNIT_AFTER_H.test(unit)) continue;     // 24,80 kg / 500,00 ST / 2,00 % / 8,00 h
+    let value = english ? parseEnglishAmount(m[0]) : parseGermanAmount(m[0]);
+    if (isNaN(value) || !isFinite(value)) continue;
+    if (value > 0 && before === "(" && after === ")") value = -value;     // accounting "(120,00)"
+    else if (value > 0 && /^ -(?:\s{2,}|\s*$)/.test(line.substring(end, end + 4))) value = -value; // "120,00 -"
+    out.push({ text: m[0].replace(/\s/g, ""), value: value, index: start, end: end });
   }
   return out;
 }
 
-function detectCurrency(text: string): string {
-  if (/€|\bEUR\b/.test(text)) return "EUR";
-  if (/\bCHF\b/.test(text)) return "CHF";
-  if (/\bUSD\b|\$/.test(text)) return "USD";
-  if (/\bGBP\b|£/.test(text)) return "GBP";
-  return "EUR";
+// Keyword classes of a label segment. afterAmount: the segment follows another amount on the same line.
+function segmentLabel(seg: string, extra: RegExp | null, afterAmount: boolean): LabelInfo {
+  let s = seg;
+  if (afterAmount) {
+    // "3.454,00 EUR überwiesen (Skonto 70,49 EUR)": the verb belongs to the previous amount
+    const pm = PAYMENT_KEYWORDS.exec(s);
+    if (pm) {
+      const rest = s.substring(pm.index + pm[0].length);
+      if (NEGATIVE_KEYWORDS.test(rest)) s = rest;
+    }
+  }
+  const lab: LabelInfo = { strong: STRONG_KEYWORDS.test(s), payment: PAYMENT_KEYWORDS.test(s), weak: WEAK_KEYWORDS.test(s), neg: NEGATIVE_KEYWORDS.test(s), ded: DEDUCTION_KEYWORDS.test(s) };
+  if (lab.payment && (YEAR_TO_DATE.test(s) || (CUMULATIVE.test(s) && !PAYMENT_LABEL.test(s)))) { lab.payment = false; lab.neg = true; }
+  if (extra !== null && extra.test(s)) { lab.strong = true; lab.payment = true; }
+  return lab;
 }
 
-function pickAmount(lines: string[], extraKeywords: string): { best: Candidate | null; candidates: Candidate[]; currency: string } {
-  const text = lines.join("\n");
-  const currency = detectCurrency(text);
-  const normLines: string[] = [];
-  for (const l of lines) normLines.push(normalizeLine(l));
-  const englishFormat = (currency === "USD" || currency === "GBP") && !/\d\.\d{3},\d{2}/.test(text) && /\d,\d{3}\.\d{2}|\d\.\d{2}\b/.test(text);
-  let extra: RegExp | null = null;
-  const ek = extraKeywords.split(/[,;|]/).map((s) => s.trim()).filter((s) => s.length > 0);
-  if (ek.length > 0) extra = new RegExp(ek.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i");
+function hasWords(s: string): boolean {
+  const t = s.replace(CURRENCY_TOKEN, " ");
+  CURRENCY_TOKEN.lastIndex = 0;
+  return /[A-Za-zÄÖÜäöüß]{2,}/.test(t);
+}
 
-  const all: Candidate[] = [];
-  const perLine: { idx: number; amounts: { text: string; value: number; index: number }[]; strong: boolean; weak: boolean; neg: boolean }[] = [];
+// Column class of a table header cell.
+function headerCellClass(cell: string): string {
+  const c = cell.toLowerCase();
+  if (/datum|date|nr\b|nr\.|nummer|number|no\.|währung|waehrung|currency|kurs|text|bezeichnung|artikel|material|referenz|reference|gewicht|menge|einheit|^pos/.test(c)) return "id";
+  if (/rest|offen|open|outstanding|balance|saldo/.test(c)) return "rest";
+  if (/skonto|abzug|discount|einbehalt|rabatt|deduction|gutschrift/.test(c)) return "ded";
+  if (/ust\b|ust\.|mwst|vat\b|steuer|tax/.test(c)) return "vat";
+  if (/zahlbetrag|zahlungsbetrag|zahlung|gezahlt|bezahlt|überw|ueberw|auszahl|paid|payment|remit/.test(c)) return "pay";
+  if (/netto|\bnet\b/.test(c)) return "net";
+  if (/brutto|gross|betrag|amount|summe|total|wert|value|preis|price/.test(c)) return "gross";
+  return "id";
+}
+
+// Cells of a line separated by 2+ spaces: [start, end) pairs.
+function lineCells(text: string): number[] {
+  const out: number[] = [];
+  const re = /\S+(?: \S+)*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) { out.push(m.index); out.push(m.index + m[0].length); }
+  return out;
+}
+
+// Maps table rows to the amount columns of the nearest header line (Rechnungsbetrag / Skonto / Zahlbetrag ...).
+function mapTableColumns(infos: LineInfo[]): void {
+  for (let h = 0; h < infos.length; h++) {
+    const hd = infos[h];
+    if (hd.amounts.length > 0 || hd.text.length === 0) continue;
+    const cells = lineCells(hd.text);
+    const n = cells.length / 2;
+    if (n < 2) continue;
+    // a label line ("Zahlbetrag gesamt:   Grund: Zahlungsavis" beside a signature box) is no table header
+    if (/:$/.test(hd.text.substring(cells[0], cells[1]))) continue;
+    const cls: string[] = [];
+    const amountCols: string[] = [];
+    let hasPay = false, hasDed = false, hasVat = false;
+    for (let c = 0; c < n; c++) {
+      const k = headerCellClass(hd.text.substring(cells[2 * c], cells[2 * c + 1]));
+      cls.push(k);
+      if (k === "pay") hasPay = true;
+      if (k === "ded") hasDed = true;
+      if (k === "vat") hasVat = true;
+    }
+    for (let c = 0; c < n; c++) {
+      if (cls[c] === "net") cls[c] = hasDed && !hasVat && !hasPay ? "pay" : "gross";
+      if (cls[c] !== "id") amountCols.push(cls[c]);
+    }
+    if (amountCols.length < 2) continue;
+    hd.header = true;
+    const rightmost = amountCols[amountCols.length - 1];
+    const rows: number[] = [];
+    let dataRows = 0;
+    for (let r = h + 1; r < infos.length && r <= h + 80; r++) {
+      const row = infos[r];
+      if (row.text.length === 0) break;
+      if (row.amounts.length === 0) {
+        if (lineCells(row.text).length >= 4 && /betrag|amount|skonto|summe/i.test(row.text)) break; // next header
+        continue;
+      }
+      if (row.amounts.length < 2) continue;
+      const k = row.amounts.length;
+      let mapped = false;
+      if (k === amountCols.length) {
+        for (let j = 0; j < k; j++) row.cols[j] = amountCols[j];
+        mapped = true;
+      } else {
+        const rc = lineCells(row.text);
+        if (rc.length === cells.length) {
+          for (let j = 0; j < k; j++) {
+            for (let c = 0; c < n; c++) {
+              if (row.amounts[j].index >= rc[2 * c] && row.amounts[j].index < rc[2 * c + 1]) { row.cols[j] = cls[c] === "id" ? "" : cls[c]; mapped = true; break; }
+            }
+          }
+        }
+      }
+      if (!mapped) { if (!row.label.strong) dataRows++; continue; }
+      for (let j = 0; j < k; j++) if (!row.lineLabel[j]) row.cols[j] = "";
+      row.risky = rightmost === "ded" || rightmost === "rest";
+      row.payCol = hasPay;
+      rows.push(r);
+      if (!row.label.strong) dataRows++;
+    }
+    for (const r of rows) infos[r].payBonus = infos[r].label.strong || dataRows === 1;
+    // "Netto | USt | Brutto" with one invoice row: the gross amount is what gets paid
+    if (dataRows === 1 && rightmost === "gross" && hasVat && !hasPay && !hasDed && amountCols.indexOf("rest") < 0) {
+      for (const r of rows) if (!infos[r].label.strong) infos[r].grossPay = true;
+    }
+  }
+}
+
+// Marks lines of appended invoice copies (heading "Rechnung ..." followed by a VAT line with an amount).
+function markInvoiceCopies(infos: LineInfo[]): void {
+  let avisPage = false; // a payment advice title earlier on the same page
+  for (let i = 0; i < infos.length; i++) {
+    if (infos[i].text.length === 0) avisPage = false;
+    else if (AVIS_TITLE.test(infos[i].text)) avisPage = true;
+    if (infos[i].amounts.length > 0 || !INVOICE_HEAD.test(infos[i].text)) continue;
+    let end = i + 1;
+    let vat = false, ded = false;
+    while (end < infos.length && infos[end].text.length > 0 && !(infos[end].amounts.length === 0 && INVOICE_HEAD.test(infos[end].text))) {
+      const inf = infos[end];
+      if (inf.amounts.length > 0 && VAT_LINE.test(inf.text)) vat = true;
+      if (inf.amounts.length > 0 && inf.labels[0].ded && !inf.labels[0].payment) ded = true;
+      end++;
+    }
+    // on the advice page itself, a block with a deduction ("abzgl. 2 % Skonto") is a per-invoice payment block, not a copy
+    if (vat && !(avisPage && ded)) for (let k = i; k < end; k++) infos[k].copy = true;
+    i = end - 1;
+  }
+}
+
+function newCandidate(a: AmountMatch, line: string, lineIdx: number, pos: number, label: LabelInfo): Candidate {
+  return { amount: a.text, value: a.value, score: 0, line: line, lineIdx: lineIdx, method: "largest", pos: pos, charIdx: a.index, label: label, lineLabel: false, ownLabel: false, confirmed: false, copy: false, risky: false, col: "" };
+}
+
+// Total T, deduction D, payment P with |T - |D| - P| < 0.015 -> prefer P, demote T.
+function deductionChain(all: Candidate[], infos: LineInfo[], candAt: Candidate[][]): void {
+  const ts: Candidate[] = [];
+  const ps: Candidate[] = [];
+  const ds: Candidate[] = [];
+  for (const c of all) {
+    const isDed = (c.label.ded && !c.label.payment) || c.col === "ded";
+    if (isDed) { if (c.value !== 0) ds.push(c); continue; }
+    if (c.value <= 0) continue;
+    if (c.label.strong && !c.label.payment && c.method !== "keyword-next-line") ts.push(c);
+    if (!c.label.neg || c.label.payment) ps.push(c);
+  }
+  if (ds.length === 0 && ts.length === 0) return;
+  if (ps.length * (ts.length + 4) > 200000 || ds.length > 2000) return;
+  const payValues: number[] = [];
+  const totValues: number[] = [];
+  for (const p of ps) {
+    const pPay = p.label.payment || p.col === "pay";
+    // candidate totals: strong totals, or (for a payment line) a single amount up to 3 lines above
+    const tlist: Candidate[] = [];
+    for (const t of ts) tlist.push(t);
+    if (pPay) {
+      for (let li = Math.max(0, p.lineIdx - 3); li < p.lineIdx; li++) {
+        if (candAt[li].length !== 1) continue;
+        const t = candAt[li][0];
+        if (!t.label.ded && !t.label.payment && !t.label.strong && t.value > 0) tlist.push(t);
+      }
+    }
+    for (const t of tlist) {
+      if (t.lineIdx === p.lineIdx || t.value <= p.value + 0.005) continue;
+      const after = p.lineIdx > t.lineIdx;
+      if (!pPay && !(after && p.lineIdx - t.lineIdx <= 4)) continue;
+      const diff = t.value - p.value;
+      const lo = Math.min(t.lineIdx, p.lineIdx), hi = Math.max(t.lineIdx, p.lineIdx);
+      let ok = false;
+      let dsum = 0, dcount = 0;
+      for (const d of ds) {
+        if (d.lineIdx === p.lineIdx || d.lineIdx === t.lineIdx) continue;
+        const between = d.lineIdx > lo && d.lineIdx < hi;
+        if (!pPay && !between) continue;
+        if (Math.abs(Math.abs(d.value) - diff) < 0.015) { ok = true; break; }
+        if (between) { dsum += Math.abs(d.value); dcount++; }
+      }
+      if (!ok && dcount >= 2 && Math.abs(dsum - diff) < 0.015) ok = true;
+      if (!ok && hi - lo <= 8) {
+        for (let k = lo; k <= hi && !ok; k++) {
+          for (const pc of infos[k].pcts) if (Math.abs(t.value * (1 - pc / 100) - p.value) < 0.015) { ok = true; break; }
+        }
+      }
+      if (!ok && pPay && after && hi - lo <= 8) {
+        for (let li = lo + 1; li < hi && !ok; li++) {
+          for (const x of candAt[li]) if (Math.abs(Math.abs(x.value) - diff) < 0.015) { ok = true; break; }
+        }
+      }
+      if (ok) {
+        let seen = false;
+        for (const v of payValues) if (Math.abs(v - p.value) < 0.005) seen = true;
+        if (!seen) { payValues.push(p.value); totValues.push(t.value); }
+        break;
+      }
+    }
+    if (payValues.length > 50) return;
+  }
+  if (payValues.length === 0) return;
+  if (payValues.length === 1) {
+    for (const c of all) {
+      if (Math.abs(c.value - payValues[0]) < 0.005 && (!c.label.neg || c.label.payment)) {
+        c.score += 3;
+        c.confirmed = true;
+        if (c.method === "largest" || c.method === "keyword-weak" || c.method === "sum-check") c.method = "deduction";
+      } else if (Math.abs(c.value - totValues[0]) < 0.005) c.score -= 2;
+    }
+    return;
+  }
+  // several invoices each paid with a deduction: the grand total is the sum of the payments
+  let sum = 0;
+  for (const v of payValues) sum += v;
+  for (const c of all) if (Math.abs(c.value - sum) < 0.015 && (c.label.strong || c.method === "column-sum")) { c.score += 2; c.confirmed = true; }
+}
+
+// Currency token closest to the amount in its line, else in the line, else the document's most frequent one.
+function chooseCurrency(best: Candidate | null, infos: LineInfo[], valueLine: string): { code: string; competing: boolean; codes: string } {
+  const counts: { [k: string]: number } = {};
+  const order: string[] = [];
+  let anyCode = "";
+  for (const inf of infos) {
+    CURRENCY_TOKEN.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = CURRENCY_TOKEN.exec(inf.text)) !== null) {
+      const code = currencyCode(m[0]);
+      if (inf.label.neg && !inf.header) continue;
+      if (anyCode === "") anyCode = code;
+      if (inf.amounts.length === 0) continue;
+      if (counts[code] === undefined) { counts[code] = 0; order.push(code); }
+      counts[code]++;
+    }
+  }
+  CURRENCY_TOKEN.lastIndex = 0;
+  let docCode = "";
+  for (const k of order) if (docCode === "" || counts[k] > counts[docCode]) docCode = k;
+  let code = "";
+  if (best !== null) {
+    let bestDist = 1e9;
+    let m: RegExpExecArray | null;
+    const at = best.charIdx, endAt = best.charIdx + best.amount.length;
+    while ((m = CURRENCY_TOKEN.exec(valueLine)) !== null) {
+      const d = m.index >= endAt ? m.index - endAt : at - (m.index + m[0].length);
+      if (d < bestDist) { bestDist = d; code = currencyCode(m[0]); }
+    }
+    CURRENCY_TOKEN.lastIndex = 0;
+    if (code === "" && best.method === "keyword-next-line") {
+      while ((m = CURRENCY_TOKEN.exec(best.line)) !== null) { code = currencyCode(m[0]); break; }
+      CURRENCY_TOKEN.lastIndex = 0;
+    }
+  }
+  if (code === "") code = docCode !== "" ? docCode : anyCode !== "" ? anyCode : "EUR";
+  return { code: code, competing: order.length >= 2, codes: order.join("/") };
+}
+
+function currencyCode(tok: string): string {
+  if (tok === "€" || /^euro$/i.test(tok)) return "EUR";
+  if (tok === "$") return "USD";
+  if (tok === "£") return "GBP";
+  if (tok === "¥") return "JPY";
+  if (tok === "zł") return "PLN";
+  if (tok === "Kč") return "CZK";
+  if (tok === "SFr" || tok === "Fr.") return "CHF";
+  return tok;
+}
+
+function emptyInfo(text: string): LineInfo {
+  const none: LabelInfo = { strong: false, payment: false, weak: false, neg: false, ded: false };
+  return { text: text, amounts: [], labels: [], lineLabel: [], own: [], cols: [], pcts: [], label: none, header: false, risky: false, payBonus: false, copy: false, wrapped: "", grossPay: false, payCol: false };
+}
+
+function downgrade(conf: string): string {
+  return conf === "high" ? "medium" : "low";
+}
+
+function pickAmount(lines: string[], extraKeywords: string): AmountPick {
+  const normLines: string[] = [];
+  // a real text line is short; capping keeps the (super)linear regexes below cheap on garbage lines
+  for (const l of lines) normLines.push(normalizeLine(l.length > 2000 ? l.substring(0, 2000) : l));
+  const english = detectEnglishFormat(normLines);
+  let extra: RegExp | null = null;
+  const ek: string[] = [];
+  for (const part of extraKeywords.split(/[,;|]/)) { const t = part.trim(); if (t.length > 0) ek.push(t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")); }
+  if (ek.length > 0) extra = new RegExp(ek.join("|"), "i");
+
+  // ---- per-line analysis: amounts and the label of each amount
+  const infos: LineInfo[] = [];
   for (let i = 0; i < normLines.length; i++) {
     const ln = normLines[i];
-    const amounts = findAmountsInLine(ln, englishFormat);
-    const strong = STRONG_KEYWORDS.test(ln) || (extra !== null && extra.test(ln));
-    const weak = WEAK_KEYWORDS.test(ln);
-    const neg = NEGATIVE_KEYWORDS.test(ln);
-    perLine.push({ idx: i, amounts: amounts, strong: strong, weak: weak, neg: neg });
-  }
-  for (let i = 0; i < perLine.length; i++) {
-    const pl = perLine[i];
-    const ln = normLines[i];
-    if (pl.amounts.length === 0) {
-      // label line without amount: amount may be on the next line(s)
-      if (pl.strong) {
-        for (let k = 1; k <= 2 && i + k < perLine.length; k++) {
-          const nx = perLine[i + k];
-          if (nx.amounts.length > 0) {
-            const a = nx.amounts[nx.amounts.length - 1];
-            let score = 4 - k;
-            if (nx.neg) score -= 2;
-            if (pl.neg) score -= 2.5;            // label line looks like a table header (Rechnungsbetrag/Skonto …)
-            if (ln.length > 45) score -= 1;       // long line = probably a header row, not a label
-            if (nx.amounts.length >= 3) score -= 1.5; // next line is a table row
-            if (/:\s*$/.test(ln)) score += 0.5;    // "Überweisungsbetrag:"
-            all.push({ amount: a.text, value: a.value, score: score, line: ln + " | " + normLines[i + k], lineIdx: i + k, method: "keyword-next-line" });
-            break;
-          }
-          if (nx.strong || nx.neg) break;
-        }
+    const inf = emptyInfo(ln);
+    inf.amounts = findAmountsInLine(ln, english);
+    inf.label = segmentLabel(ln, extra, false);
+    const reP = /(\d{1,2}(?:[.,]\d{1,2})?) ?%/g;
+    let pm: RegExpExecArray | null;
+    while ((pm = reP.exec(ln)) !== null) { const p = parseFloat(pm[1].replace(",", ".")); if (p > 0 && p <= 10) inf.pcts.push(p); }
+    const k = inf.amounts.length;
+    for (let j = 0; j < k; j++) {
+      const a = inf.amounts[j];
+      let pre = ln.substring(j === 0 ? 0 : inf.amounts[j - 1].end, a.index);
+      // wrapped letter text "... überwiesen haben. Die Zahlung betrifft Rechnung X über 1.000,00": the verb ends an earlier sentence
+      const sv = pre.search(/(?:überwiesen|ueberwiesen|gutgeschrieben|angewiesen|beglichen|bezahlt|ausgeglichen)(?: haben| hat| wurde| worden| wird)?\. /i);
+      if (sv >= 0) pre = pre.substring(pre.indexOf(". ", sv) + 2);
+      const own = j === 0 ? true : hasWords(pre);
+      inf.own.push(j > 0 && own);
+      inf.lineLabel.push(j === 0 || !own);
+      let lab: LabelInfo;
+      if (j === 0 || own) lab = segmentLabel(pre, extra, j > 0);
+      else { const l0 = inf.labels[0]; lab = { strong: l0.strong, payment: l0.payment, weak: l0.weak, neg: l0.neg, ded: l0.ded }; }
+      if (!lab.payment && (j === 0 || own)) {
+        // payment verb after the amount: "Wir haben 3.454,00 EUR überwiesen"
+        const post = ln.substring(a.end, j + 1 < k ? inf.amounts[j + 1].index : ln.length);
+        const pi = post.search(POST_PAYMENT);
+        const ni = post.search(NEGATIVE_KEYWORDS);
+        if (pi >= 0 && (ni < 0 || pi < ni)) { lab.payment = true; lab.strong = true; }
       }
-      continue;
+      inf.labels.push(lab);
+      inf.cols.push("");
     }
-    for (let j = 0; j < pl.amounts.length; j++) {
-      const a = pl.amounts[j];
+    infos.push(inf);
+  }
+  // wrapped letter text "... einen Betrag von 3.454,00 EUR" / "an Sie überwiesen haben.": the verb at the start of the next line belongs to the amount ending this line
+  for (let i = 0; i + 1 < infos.length; i++) {
+    const inf = infos[i], nx = infos[i + 1];
+    const k = inf.amounts.length;
+    if (k === 0) continue;
+    const lab = inf.labels[k - 1];
+    if (lab.payment) continue;
+    // "abzüglich Skonto einen Betrag von 3.454,00 EUR": the deduction words describe the paid amount
+    const intro = /\beinen (?:gesamt)?betrag von\s*$/i.test(inf.text.substring(0, inf.amounts[k - 1].index));
+    if (lab.neg && !intro) continue;
+    if (hasWords(inf.text.substring(inf.amounts[k - 1].end))) continue;
+    const lead0 = nx.amounts.length > 0 ? nx.text.substring(0, nx.amounts[0].index) : nx.text;
+    const dot = lead0.indexOf(". ");
+    const lead = dot >= 0 ? lead0.substring(0, dot) : lead0;
+    // only a sentence that wraps: words before the amount and a lower-case continuation on the next line
+    if (!/^[a-zäöüß]/.test(nx.text) || (inf.text.substring(0, inf.amounts[k - 1].index).match(/[A-Za-zÄÖÜäöüß]{2,}/g) || []).length < 3) continue;
+    if (lead.length <= 40 && POST_PAYMENT.test(lead) && !NEGATIVE_KEYWORDS.test(lead)) { lab.payment = true; lab.strong = true; lab.neg = false; lab.ded = false; }
+  }
+  mapTableColumns(infos);
+  markInvoiceCopies(infos);
+  // table headers written with single spaces ("Rechnung   Datum Betrag Skonto Zahlbetrag")
+  for (const inf of infos) {
+    if (inf.amounts.length === 0 && !inf.header && (inf.text.match(/datum|date|betrag|skonto|rechnung|beleg|amount|invoice|discount/gi) || []).length >= 3) inf.header = true;
+  }
+  // label wrapped around its value in a narrow column: "Überwei-" / "3.454,00 €" / "sungsbetrag"
+  for (let i = 1; i + 1 < infos.length; i++) {
+    const inf = infos[i];
+    if (inf.amounts.length !== 1 || hasWords(inf.text)) continue;
+    const up = infos[i - 1], down = infos[i + 1];
+    if (up.amounts.length > 0 || down.amounts.length > 0 || up.header || down.header || !hasWords(up.text) || !hasWords(down.text)) continue;
+    if (up.text.length > 40 || down.text.length > 40 || /:\s*$/.test(up.text) || /:\s*$/.test(down.text)) continue;
+    // the line below must be a continuation, not the label of the next value
+    if (i + 2 < infos.length && infos[i + 2].amounts.length > 0 && !hasWords(infos[i + 2].text)) continue;
+    const joined = /[a-zäöüß]-$/.test(up.text) ? up.text.substring(0, up.text.length - 1) + down.text : up.text + " " + down.text;
+    inf.labels[0] = segmentLabel(joined, extra, false);
+    inf.label = inf.labels[0];
+    inf.wrapped = joined;
+  }
+
+  // ---- candidates
+  const all: Candidate[] = [];
+  const candAt: Candidate[][] = [];
+  const n = Math.max(1, normLines.length);
+  for (let i = 0; i < infos.length; i++) {
+    const inf = infos[i];
+    const row: Candidate[] = [];
+    const k = inf.amounts.length;
+    for (let j = 0; j < k; j++) {
+      const a = inf.amounts[j];
+      const lab = inf.labels[j];
+      const c = newCandidate(a, inf.wrapped !== "" ? inf.wrapped + " | " + inf.text : inf.text, i, j, lab);
+      c.lineLabel = inf.lineLabel[j];
+      c.ownLabel = inf.wrapped !== "" || (j === 0 ? hasWords(inf.text.substring(0, a.index)) : inf.own[j]);
+      c.col = inf.cols[j];
+      c.risky = inf.risky && c.col !== "";
+      c.copy = inf.copy;
       let score = 0;
-      let method = "largest";
-      if (pl.strong) { score += 5; method = "keyword"; }
-      else if (pl.weak) { score += 1.5; method = "keyword-weak"; }
-      if (PAYMENT_KEYWORDS.test(ln)) score += 1.5;   // "Zahlbetrag" beats "Summe Rechnungsbetrag"
-      if (pl.neg && !pl.strong) score -= 2;
-      if (pl.neg && pl.strong && !PAYMENT_KEYWORDS.test(ln)) score -= 2;
-      if (j === pl.amounts.length - 1) score += 0.5; // right-most amount on the line
-      // currency symbol right next to the amount
-      const around = ln.substring(Math.max(0, a.index - 6), Math.min(ln.length, a.index + a.text.length + 6));
-      if (/€|EUR|CHF|USD|GBP/.test(around)) score += 0.75;
+      if (lab.strong) { score += 5; c.method = "keyword"; }
+      else if (lab.weak) { score += 1.5; c.method = "keyword-weak"; }
+      if (c.col === "pay" && inf.payBonus) {
+        if (!lab.payment) { lab.payment = true; score += 1.5; }
+        score += 1;
+        if (c.method === "largest" || c.method === "keyword-weak") c.method = "column-header";
+      } else if (lab.payment) score += 1.5;
+      if (lab.neg && !lab.payment) score -= 2;
+      if (c.col === "ded" || c.col === "rest" || c.col === "vat") score -= 2;
+      if (c.col === "gross" && inf.payBonus) score -= 0.5;
+      if (c.lineLabel && j === k - 1 && (c.col === "" || c.col === "pay")) score += 0.5; // right-most amount on the line
+      const around = inf.text.substring(Math.max(0, a.index - 6), Math.min(inf.text.length, a.end + 6));
+      if (/€|EUR|CHF|USD|GBP|PLN|CZK|SEK/.test(around)) score += 0.75;
       if (a.value === 0) score -= 3;
-      // position: totals are usually in the lower part of the document
-      score += (i / Math.max(1, normLines.length)) * 0.5;
-      all.push({ amount: a.text, value: a.value, score: score, line: ln, lineIdx: i, method: method });
+      if (inf.copy) score -= 3;
+      score += (i / n) * 0.5;
+      c.score = score;
+      all.push(c);
+      row.push(c);
+    }
+    candAt.push(row);
+  }
+  // label line without amount: amount may be on the next line(s)
+  for (let i = 0; i < infos.length; i++) {
+    const inf = infos[i];
+    if (inf.amounts.length > 0 || !inf.label.strong || inf.header) continue;
+    // an unreadable amount in the label line itself ("Zahlbetrag 3.454 EUR") – do not borrow from the next line
+    // (only an amount-like number counts: thousands groups or a number next to a currency, not "Rechnung 4711" / "Avis 2026-0815")
+    if (/\d{1,3}(?:[.']\d{3})+(?![\d,])|\d\s*(?:EUR|€|CHF|USD|GBP)\b|(?:EUR|€|CHF|USD|GBP)\s*\d/i.test(inf.text.replace(/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/g, " "))) continue;
+    for (let k = 1; k <= 2 && i + k < infos.length; k++) {
+      const nx = infos[i + k];
+      if (nx.header || nx.wrapped !== "") break; // "Wir überweisen Ihnen folgende Posten:" followed by a table
+      if (nx.amounts.length > 0) {
+        // a row with several amounts ("Rechnung 4711   3.524,49   70,49") is the value of the label above only when
+        // its last amount follows from the others (gross - Skonto = payment, net + VAT = gross)
+        const kn = nx.amounts.length;
+        if (kn >= 2) {
+          const last = nx.amounts[kn - 1].value, first = nx.amounts[0].value;
+          let fits = Math.abs(first - last) < 0.005;
+          for (let q = 1; q < kn - 1 && !fits; q++) {
+            const mid = Math.abs(nx.amounts[q].value);
+            if (Math.abs(first - mid - last) < 0.015 || Math.abs(first + mid - last) < 0.015) fits = true;
+          }
+          if (!fits) break;
+        }
+        const a = nx.amounts[nx.amounts.length - 1];
+        let score = 4 - k;
+        if (nx.label.neg) score -= 2;
+        if (inf.label.neg && !inf.label.payment) score -= 2.5; // label line looks like a table header (Rechnungsbetrag/Skonto …)
+        if (inf.label.payment) score += 1.5;
+        if (inf.text.length > 45) score -= 1;       // long line = probably a header row, not a label
+        if (nx.amounts.length >= 3) score -= 1.5;   // next line is a table row
+        if (/:\s*$/.test(inf.text)) score += 0.5;    // "Überweisungsbetrag:"
+        if (inf.copy || nx.copy) score -= 3;
+        if (a.value === 0) score -= 3;               // same zero penalty as on the label line itself
+        score += ((i + k) / n) * 0.5;
+        const c = newCandidate(a, inf.text + " | " + nx.text, i + k, -1, inf.label);
+        c.method = "keyword-next-line";
+        c.score = score;
+        c.charIdx = a.index;
+        c.copy = inf.copy || nx.copy;
+        c.ownLabel = true;
+        all.push(c);
+        break;
+      }
+      if (nx.label.strong || (nx.label.neg && (/:\s*$/.test(nx.text) || nx.text.split(" ").length <= 2))) break;
     }
   }
-  // "column sum" signal: the total equals the sum of the last amounts of the preceding rows (Zahlbetrag column)
-  let running = 0, contributing = 0;
-  for (let i = 0; i < perLine.length; i++) {
-    const pl = perLine[i];
-    if (pl.amounts.length === 0) continue;
-    const last = pl.amounts[pl.amounts.length - 1];
-    if (contributing >= 2 && Math.abs(running - last.value) < 0.015 && last.value !== 0) {
-      for (const c of all) {
-        if (c.lineIdx === i && c.amount === last.text && c.method !== "keyword-next-line") {
-          c.score += 2.5;
-          if (c.method === "largest" || c.method === "keyword-weak") c.method = "column-sum";
+
+  // ---- column sum: a total equals a run of 2+ rows directly above (same column, counted from the right)
+  for (let i = 0; i < infos.length; i++) {
+    const k = infos[i].amounts.length;
+    for (let r = 0; r < k; r++) {
+      const c = candAt[i][k - 1 - r];
+      const v = c.value;
+      if (v === 0 || !c.lineLabel) continue;
+      let s = 0, cnt = 0, steps = 0, match = false, firstRow = -1;
+      for (let j = i - 1; j >= 0 && steps < 80 && cnt < 40; j--) {
+        steps++;
+        const kj = infos[j].amounts.length;
+        if (kj === 0) continue;
+        if (r > 0 && kj !== k) break;
+        const a = kj === k ? infos[j].amounts[kj - 1 - r] : infos[j].amounts[kj - 1];
+        // a single deduction line above a payment ("abzüglich 2 % Skonto 71,40") reduces the run
+        if (r === 0 && kj === 1 && infos[j].labels[0].ded && !infos[j].labels[0].payment) s -= Math.abs(a.value);
+        else s += a.value;
+        cnt++;
+        if (cnt === 1) firstRow = j;
+        if (cnt >= 2 && Math.abs(s - v) < 0.015) { match = true; break; }
+      }
+      // single row + total row with identical amounts ("RE1001 1.190,00 23,80 1.166,20" / "Summe 1.190,00 23,80 1.166,20")
+      if (!match && k >= 2 && firstRow >= 0 && infos[i].label.strong && infos[firstRow].amounts.length === k) {
+        let same = true;
+        for (let q = 0; q < k; q++) if (Math.abs(infos[firstRow].amounts[q].value - infos[i].amounts[q].value) >= 0.005) same = false;
+        match = same;
+      }
+      if (!match) continue;
+      c.confirmed = true;
+      if (r === 0) {
+        c.score += 2.5;
+        if (c.method === "largest" || c.method === "keyword-weak") c.method = "column-sum";
+      }
+    }
+  }
+  // total row "Summe 3.570,00 71,40 3.498,60": gross = deduction + payment, deduction small (Skonto) -> reward the payment
+  for (let i = 0; i < infos.length; i++) {
+    const inf = infos[i];
+    const k = inf.amounts.length;
+    if (k < 3 || !inf.label.strong) continue;
+    let ai = 0;
+    for (let j = 1; j < k; j++) if (inf.amounts[j].value > inf.amounts[ai].value) ai = j;
+    const a = inf.amounts[ai].value;
+    let done = false;
+    for (let b = 0; b < k && !done; b++) {
+      for (let c2 = b + 1; c2 < k && !done; c2++) {
+        if (b === ai || c2 === ai) continue;
+        const vb = inf.amounts[b].value, vc = inf.amounts[c2].value;
+        if (vb <= 0 || vc <= 0 || Math.abs(a - vb - vc) >= 0.015) continue;
+        if (Math.min(vb, vc) > 0.05 * a) continue;
+        const big = vb >= vc ? b : c2;
+        candAt[i][big].score += 2;
+        candAt[i][big].confirmed = true;
+        done = true;
+      }
+    }
+  }
+  // "sum of the others": an amount equals the sum of the amounts on keyword-free lines
+  const plain: Candidate[] = [];
+  let plainTotal = 0;
+  for (const c of all) if (c.method === "largest") { plain.push(c); plainTotal += c.value; }
+  if (plain.length >= 2) {
+    for (const c of all) {
+      if (c.method === "keyword-next-line" || c.value === 0) continue;
+      const inPlain = c.method === "largest" || c.method === "sum-check";
+      if (inPlain && plain.length < 3) continue;
+      const others = inPlain ? plainTotal - c.value : plainTotal;
+      if (Math.abs(others - c.value) >= 0.015) continue;
+      if (inPlain && plain.length === 3) {
+        // exactly two parts: gross = Skonto + net (small part <= 5 %) -> the net part is the payment
+        const parts: Candidate[] = [];
+        for (const p of plain) if (p !== c) parts.push(p);
+        const big = Math.abs(parts[0].value) >= Math.abs(parts[1].value) ? parts[0] : parts[1];
+        const small = big === parts[0] ? parts[1] : parts[0];
+        if (Math.abs(small.value) <= 0.05 * Math.abs(c.value)) {
+          big.score += 2;
+          big.confirmed = true;
+          big.method = "sum-check";
+          continue;
         }
       }
-      running = 0; contributing = 0; // a total line resets the column
-      continue;
+      c.score += 2;
+      c.confirmed = true;
+      if (c.method === "largest") c.method = "sum-check";
     }
-    running += last.value;
-    contributing++;
   }
-  // "sum of the others" signal: if one amount equals the sum of the remaining amounts on keyword-free lines
-  const plain = all.filter((c) => c.method === "largest");
-  if (plain.length >= 3) {
-    const total = plain.reduce((s, c) => s + c.value, 0);
+  deductionChain(all, infos, candAt);
+  // a total that equals the sum of several payment lines ("Zahlbetrag" per invoice, then "Gesamt") is the grand total
+  {
+    const payVals: number[] = [];
+    const payLines: number[] = [];
     for (const c of all) {
-      const others = plain.indexOf(c) >= 0 ? total - c.value : total;
-      if (Math.abs(others - c.value) < 0.015 && c.value !== 0) { c.score += 2; if (c.method === "largest") c.method = "sum-check"; }
+      if (!c.label.payment || !c.ownLabel || c.copy || c.value <= 0 || c.label.neg || payLines.indexOf(c.lineIdx) >= 0) continue;
+      payVals.push(c.value);
+      payLines.push(c.lineIdx);
+      if (payVals.length > 200) break;
+    }
+    if (payVals.length >= 2 && payVals.length <= 200) {
+      for (const c of all) {
+        if (!c.label.strong || c.value <= 0 || c.copy) continue;
+        let sum = 0, parts = 0;
+        for (let q = 0; q < payVals.length; q++) if (payLines[q] !== c.lineIdx && payLines[q] < c.lineIdx) { sum += payVals[q]; parts++; }
+        if (parts >= 2 && Math.abs(sum - c.value) < 0.015) {
+          c.score += 2.5;
+          c.confirmed = true;
+          for (const d of all) if (d !== c && d.label.payment && d.lineIdx < c.lineIdx && Math.abs(d.value - c.value) >= 0.005) d.score -= 1;
+        }
+      }
+    }
+  }
+  // two different strong lines naming the same value confirm each other
+  const strongLines = new Map<number, number[]>();
+  for (const c of all) {
+    if (!(c.label.strong || c.method === "keyword-next-line") || c.label.neg || c.copy || c.value === 0) continue;
+    const key = Math.round(c.value * 100);
+    let arr = strongLines.get(key);
+    if (!arr) { arr = []; strongLines.set(key, arr); }
+    if (arr.indexOf(c.lineIdx) < 0) arr.push(c.lineIdx);
+  }
+  for (const c of all) {
+    if (!(c.label.strong || c.method === "keyword-next-line") || c.label.neg || c.copy || c.value === 0) continue;
+    const arr = strongLines.get(Math.round(c.value * 100));
+    if (!arr || arr.length > 3) continue; // a value repeated on many rows is a per-invoice amount, not a confirmation
+    for (const li of arr) {
+      if (li === c.lineIdx) continue;
+      if (Math.abs(li - c.lineIdx) <= 1 && c.method === "keyword-next-line") continue;
+      c.score += 1;
+      break;
     }
   }
   // magnitude: bigger amounts get a small bonus (totals are larger than line items)
@@ -2100,7 +3666,185 @@ function pickAmount(lines: string[], extraKeywords: string): { best: Candidate |
   for (const c of all) maxAbs = Math.max(maxAbs, Math.abs(c.value));
   for (const c of all) if (maxAbs > 0) c.score += (Math.abs(c.value) / maxAbs) * 1.0;
   all.sort((a, b) => (b.score - a.score) || (b.lineIdx - a.lineIdx));
-  return { best: all.length > 0 ? all[0] : null, candidates: all.slice(0, 8), currency: currency };
+  // (e) the chosen total is not a payment, but a payment-worded line names a different amount:
+  // uncertain; suggest that payment when it is the only one and looks like the total minus deductions
+  let conflict = "";
+  if (all.length > 0 && !all[0].label.payment && all[0].col !== "pay") {
+    const top = all[0];
+    let paySum = 0, other: Candidate | null = null, distinct = 0;
+    const seenPay = new Map<number, boolean>();
+    for (const c of all) {
+      if (!c.label.payment || !c.ownLabel || c.copy || c.value <= 0 || c.label.neg) continue;
+      if (c.method === "keyword-next-line" && c.line.indexOf(" | ") > 45) {
+        // a sentence, not a label – unless it runs into the amount: "... überweisen wir Ihnen in Höhe von" / "3.454,00 EUR"
+        const lbl = c.line.substring(0, c.line.indexOf(" | "));
+        if (!/(?:\bvon|\bhöhe|\bbetrag|\bsumme)\s*:?\s*$/i.test(lbl) || hasWords(infos[c.lineIdx].text)) continue;
+      }
+      const key = Math.round(c.value * 100);
+      if (seenPay.has(key)) continue;
+      seenPay.set(key, true);
+      distinct++;
+      paySum += c.value;
+      if (Math.abs(c.value - top.value) >= 0.005 && other === null) other = c;
+    }
+    if (other !== null && Math.abs(paySum - top.value) >= 0.015) {
+      conflict = "payment line says " + other.amount + ", total says " + top.amount;
+      if (distinct === 1 && other.value < top.value && other.value >= 0.9 * top.value) {
+        all.splice(all.indexOf(other), 1);
+        all.unshift(other);
+      }
+    }
+  }
+  const best = all.length > 0 ? all[0] : null;
+  const cur = chooseCurrency(best, infos, best !== null ? infos[best.lineIdx].text : "");
+  const out: AmountPick = { best: best, candidates: all.slice(0, 8), currency: cur.code, confidence: "low", reason: "" };
+  if (best === null) return out;
+
+  // ---- confidence: rule quality + distance to the next different amount + absolute score floors
+  const text = normLines.join("\n");
+  const avisTitle = AVIS_TITLE.test(text);
+  let margin = 99;
+  let runnerUp: Candidate | null = null;
+  for (const c of all) if (Math.abs(c.value - best.value) >= 0.005) { margin = best.score - c.score; runnerUp = c; break; }
+  const m = best.method;
+  let weakAlone = false;
+  if (m === "keyword-weak" && !best.confirmed) {
+    for (const c of all) if (Math.abs(c.value - best.value) >= 0.005 && c.value !== 0 && !c.label.neg && !c.label.ded && c.col === "" && !c.copy) { weakAlone = true; break; }
+  }
+  const strongRule = m === "keyword" || m === "keyword-next-line" || m === "column-sum" || m === "deduction" || (m === "column-header" && best.confirmed);
+  let conf = "low";
+  let reason = "";
+  if (strongRule && margin >= 1.5 && best.score >= 4) conf = "high";
+  else if (margin >= 0.75 && best.score >= 2.5 && m !== "largest" && m !== "sum-check" && !weakAlone) conf = "medium";
+  else if (m === "sum-check" && avisTitle && best.col === "gross" && infos[best.lineIdx].grossPay && best.pos === infos[best.lineIdx].amounts.length - 1 && margin >= 0.75 && best.score >= 2.5) conf = "medium";
+  else if (m === "largest") reason = "no label, amount chosen by size";
+  else if (m === "sum-check") reason = "amount only backed by a sum check";
+  else if (weakAlone) reason = "only a weak label (Betrag/Zahlung)";
+  else if (runnerUp !== null && margin < 0.75) reason = "close runner-up " + runnerUp.amount;
+  else reason = "weak signals";
+
+  const reasons: string[] = [];
+  if (reason !== "") reasons.push(reason);
+  // document check: a payment advice talks about paying; delivery notes and direct debits do not count
+  const nonPay = avisTitle ? null : NON_PAYMENT_MARKER.exec(text);
+  if (nonPay) { conf = "low"; reasons.unshift("'" + nonPay[0] + "' - not a payment advice?"); }
+  else if (!PAYMENT_MARKER.test(text) && !PAYMENT_MARKER.test(text.replace(/\s+/g, ""))) { conf = "low"; reasons.unshift("no payment wording - not a payment advice?"); }
+  if (best.copy) { conf = "low"; reasons.push("amount from an attached invoice copy"); }
+  else {
+    // a total right after a VAT line looks like an invoice – unless it is the only total (self-billing credit note)
+    let otherTotal = false;
+    for (const c of all) if (c.label.strong && !c.label.neg && Math.abs(c.value - best.value) >= 0.005 && Math.abs(c.lineIdx - best.lineIdx) > 3) { otherTotal = true; break; }
+    for (let k = Math.max(0, best.lineIdx - 3); k < best.lineIdx && otherTotal; k++) {
+      if (infos[k].amounts.length > 0 && VAT_LINE.test(infos[k].text) && !infos[k].header) { conf = "low"; reasons.push("total follows a VAT line - invoice?"); break; }
+    }
+  }
+  if (best.risky) {
+    // a separate labelled line with the same amount outside the table settles it
+    let backed = false;
+    for (const c of all) if (!c.risky && c.ownLabel && c.label.strong && !c.label.neg && Math.abs(c.value - best.value) < 0.005) backed = true;
+    if (!backed) { conf = "low"; reasons.push("Skonto/Rest column on the right of the table"); }
+  }
+  // (d) another strong amount equals the best amount minus a deduction
+  const dedValues: number[] = [];
+  const pctValues: number[] = [];
+  for (const d of all) {
+    if (!((d.label.ded && !d.label.payment) || d.col === "ded") || d.value === 0) continue;
+    const v = Math.abs(d.value);
+    let dup = false;
+    for (const x of dedValues) if (Math.abs(x - v) < 0.005) dup = true;
+    if (!dup && dedValues.length < 200) dedValues.push(v);
+  }
+  for (const inf of infos) for (const pc of inf.pcts) if (pctValues.indexOf(pc) < 0) pctValues.push(pc);
+  let nearDed = false;
+  for (const s of all) {
+    if (nearDed) break;
+    if (s.value <= 0 || s.value >= best.value - 0.005 || s.label.neg || !(s.label.strong || s.label.payment || s.method === "keyword-next-line")) continue;
+    for (const v of dedValues) if (Math.abs(best.value - v - s.value) < 0.015) nearDed = true;
+    for (const pc of pctValues) if (Math.abs(best.value * (1 - pc / 100) - s.value) < 0.015) nearDed = true;
+  }
+  if (!nearDed && !best.confirmed && best.value > 0) {
+    // best = S + D with S >= 90 % of best and D another amount (deduction without a readable label)
+    const vals: number[] = [];
+    for (const c of all) if (c.value > 0 && !c.copy && vals.length < 400) vals.push(c.value);
+    for (const sv of vals) {
+      if (nearDed) break;
+      if (sv >= best.value - 0.005 || sv < 0.9 * best.value) continue;
+      for (const dv of vals) if (Math.abs(best.value - sv - dv) < 0.015) { nearDed = true; break; }
+    }
+  }
+  if (nearDed) { conf = "low"; reasons.push("deduction near the total"); }
+  else if (best.value > 0) {
+    // the chosen amount looks like the deduction itself: total T - best = another amount U (best <= 10 % of T)
+    const vals: number[] = [];
+    for (const c of all) if (c.value > 0 && vals.length < 400) vals.push(c.value);
+    let looksDed = false;
+    for (const tv of vals) {
+      if (looksDed) break;
+      if (best.value > 0.1 * tv) continue;
+      for (const uv of vals) if (Math.abs(tv - best.value - uv) < 0.015) { looksDed = true; break; }
+    }
+    if (looksDed) { conf = "low"; reasons.push("amount looks like a deduction"); }
+  }
+  if (conflict !== "") { conf = "low"; reasons.push(conflict); }
+  // a bare table total in the payment column only counts credit notes listed below it ("Summe Gutschriften 238,00")
+  const payCell = best.col === "pay" && !best.ownLabel;
+  if (((!best.label.payment && best.col !== "pay") || payCell) && best.value > 0) {
+    let dsum = 0, open = false;
+    for (let k = best.lineIdx + 1; k <= best.lineIdx + 4 && k < infos.length; k++) {
+      const inf = infos[k];
+      if (inf.amounts.length !== 1 || !inf.labels[0].ded || inf.labels[0].payment) continue;
+      if (payCell && !/gutschrift|credit note/i.test(inf.text)) continue;
+      // a short deduction line ("abzüglich 2 % Skonto 71,40", "Skonto 26,00"), not a sentence
+      if (inf.text.length - inf.amounts[0].text.length > 40) continue;
+      dsum += Math.abs(inf.amounts[0].value);
+      let found = false;
+      for (const c of all) if (Math.abs(c.value - (best.value - dsum)) < 0.015) { found = true; break; }
+      if (!found) open = true;
+    }
+    if (open) { conf = "low"; reasons.push("deduction below the total"); }
+  }
+  // (c) a payment label whose amount could not be read
+  for (let i = 0; i < infos.length; i++) {
+    const inf = infos[i];
+    if (inf.amounts.length > 0 || inf.header) continue;
+    const pm = PAYMENT_LABEL.exec(inf.text);
+    if (!pm) continue;
+    const tail = inf.text.substring(pm.index + pm[0].length).replace(CURRENCY_TOKEN, " ").replace(/\b(?:in|gesamt|total|insgesamt)\b/gi, " ");
+    CURRENCY_TOKEN.lastIndex = 0;
+    if (/[A-Za-zÄÖÜäöüß]{2,}/.test(tail)) continue;
+    let found = false;
+    for (let k = 1; k <= 2 && i + k < infos.length; k++) {
+      const nx = infos[i + k];
+      // a line with its own deduction/balance label ("Offener Saldo ... 12.500,00") is not the missing amount
+      if (nx.amounts.length > 0 && !(nx.labels[0].neg && !nx.labels[0].payment && hasWords(nx.text.substring(0, nx.amounts[0].index)))) found = true;
+    }
+    if (!found) { conf = "low"; reasons.push("payment label without readable amount"); break; }
+  }
+  // (f) a second payment-labelled amount that only the size/position bonuses separate from the best: ambiguous;
+  // a bigger payment total ("Gesamtzahlbetrag") that lost against one invoice payment: also ambiguous
+  if (best.label.payment && conf !== "low") {
+    for (const c of all) {
+      if (c === best || !c.label.payment || c.label.ded || !c.ownLabel || c.copy || c.value <= 0 || Math.abs(c.value - best.value) < 0.005) continue;
+      const biggerTotal = c.value > best.value && c.label.strong && c.lineIdx !== best.lineIdx && infos[c.lineIdx].amounts.length === 1 && /gesamt|total|summe|insgesamt/i.test(c.line);
+      if ((!best.confirmed && best.score - c.score < 1.5) || biggerTotal) { conf = "low"; reasons.push("second payment amount " + c.amount); }
+      break;
+    }
+  }
+  // two bare sum lines ("Bezahlte Rechnungen" ... 3.454,00 / "Offene Rechnungen" ... 19.440,00): which one is paid is unclear
+  if (m === "column-sum" && !best.ownLabel && conf !== "low") {
+    for (const c of all) if (c.method === "column-sum" && !c.ownLabel && c.lineIdx !== best.lineIdx && Math.abs(c.value - best.value) >= 0.005) { conf = "low"; reasons.push("several unlabelled sums"); break; }
+  }
+  // the gross column of a table that has a payment column: the payment cell is missing or unreadable
+  if (best.col === "gross" && infos[best.lineIdx].payCol && conf !== "low") { conf = "low"; reasons.push("gross column chosen, payment column empty"); }
+  // a zero amount is trusted only under a clean payment label ("Zahlbetrag 0,00" after netting)
+  if (best.value === 0 && conf !== "low" && (!best.label.payment || best.label.neg || best.label.ded)) { conf = "low"; reasons.push("amount is zero"); }
+  if (cur.competing && conf !== "low") { conf = downgrade(conf); if (conf === "low") reasons.push("several currencies (" + cur.codes + ")"); }
+  out.confidence = conf;
+  if (conf === "low") {
+    if (reasons.length === 0) reasons.push("weak signals");
+    out.reason = reasons.slice(0, 2).join("; ");
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -2108,25 +3852,57 @@ function pickAmount(lines: string[], extraKeywords: string): { best: Candidate |
 // ---------------------------------------------------------------------
 const MAX_TEXT_CHARS = 100000;
 
-function extractPdf(bytes: Uint8Array): { lines: string[]; pages: number; warnings: string[]; encrypted: boolean } {
+// Result of the extraction step. encrypted: the PDF cannot be decrypted (cryptError says why);
+// incomplete: reasons why the text may be partial; ocr: an OCR text layer makes up most of the text.
+interface ExtractInfo { lines: string[]; pages: number; warnings: string[]; encrypted: boolean; cryptError: string; incomplete: string[]; ocr: boolean }
+
+function extractPdf(bytes: Uint8Array): ExtractInfo {
   const s = bytesToLatin1(bytes, 0, bytes.length);
   const doc = new PdfDoc(s);
   doc.load();
-  if (doc.encrypted) return { lines: [], pages: 0, warnings: doc.warnings, encrypted: true };
+  const info: ExtractInfo = { lines: [], pages: 0, warnings: doc.warnings, encrypted: false, cryptError: "", incomplete: doc.incomplete, ocr: false };
+  if (doc.cryptStatus !== "none" && doc.cryptStatus !== "decrypted") {
+    info.encrypted = true;
+    info.cryptError = doc.cryptStatus === "password" ? "PDF is password protected - cannot be read"
+      : doc.cryptStatus === "certificate" ? "PDF is encrypted with a certificate - cannot be read"
+      : "PDF is encrypted with an unsupported method (" + doc.cryptDetail + ") - cannot be read";
+    return info;
+  }
   const pages = doc.pages();
   const interp = new ContentInterpreter(doc);
+  const boxes: number[][] = [];
   for (let i = 0; i < pages.length; i++) {
-    if (Date.now() > runDeadline) { doc.warnings.push("time budget exhausted, text truncated"); break; }
+    boxes.push(pages[i].box);
+    if (Date.now() > runDeadline) {
+      doc.warnings.push("time budget exhausted, text truncated");
+      doc.flagIncomplete("time budget exhausted");
+      break;
+    }
+    interp.beginPage(pages[i].box);
     try {
       const content = doc.pageContent(pages[i].dict);
       interp.runPage(content, pages[i].resources, i);
       interp.runAnnotations(pages[i].dict, pages[i].resources, i);
     } catch (e) {
       doc.warnings.push("page " + (i + 1) + ": " + String(e));
+      doc.flagIncomplete("page " + (i + 1) + " could not be read");
     }
+    interp.endPage();
   }
-  const lines = assembleLines(interp.items);
-  return { lines: lines, pages: pages.length, warnings: doc.warnings, encrypted: false };
+  info.lines = assembleLines(interp.finishItems(boxes));
+  info.pages = pages.length;
+  // glyphs without a Unicode mapping: their text (possibly the amount) is lost
+  if (interp.glyphsNoUni >= 3 && interp.glyphsNoUni > 0.03 * interp.glyphsTotal) doc.flagIncomplete(interp.glyphsNoUni + " of " + interp.glyphsTotal + " glyphs without Unicode mapping");
+  // OCR text layer: invisible / OCR-font text, text under a page image, or an OCR producer on image pages
+  let ocrGlyphs = interp.glyphsOcr + interp.glyphsCovered;
+  if (interp.pagesWithImage > 0 && /tesseract|ocrmypdf|abbyy|finereader|readiris|omnipage|paper capture|scansoft|\bocr\b/i.test(doc.producerInfo())) ocrGlyphs += interp.glyphsOnImagePages;
+  info.ocr = interp.glyphsTotal > 0 && ocrGlyphs * 2 > interp.glyphsTotal;
+  const front: string[] = [];
+  if (doc.cryptStatus === "decrypted") front.push("decrypted (permissions-only encryption)");
+  if (info.ocr) front.push("OCR text layer (" + Math.round((100 * ocrGlyphs) / interp.glyphsTotal) + " % of the text)");
+  for (const r of doc.incomplete) front.push("incomplete: " + r);
+  info.warnings = front.concat(doc.warnings);
+  return info;
 }
 
 function emptyResult(): AvisResult {
@@ -2153,28 +3929,38 @@ function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?:
     const ex = extractPdf(bytes);
     res.pages = ex.pages;
     res.warnings = ex.warnings.slice(0, 20).join(" | ");
-    if (ex.encrypted) { res.error = "PDF is encrypted – not supported"; return res; }
+    if (ex.encrypted) { res.error = ex.cryptError; return res; }
     const text = ex.lines.join("\n");
     res.textLength = text.length;
     res.text = text.length > MAX_TEXT_CHARS ? text.substring(0, MAX_TEXT_CHARS) : text;
     if (text.replace(/\s/g, "").length === 0) { res.error = ex.pages === 0 ? "no pages found" : "no text layer found (scanned PDF?)"; return res; }
     const pick = pickAmount(ex.lines, extraKeywords || "");
     res.currency = pick.currency;
-    res.candidates = pick.candidates.map((c) => c.amount + " | " + c.score.toFixed(2) + " | " + c.method + " | " + c.line.substring(0, 120));
+    res.candidates = [];
+    for (const c of pick.candidates) res.candidates.push(c.amount + " | " + c.score.toFixed(2) + " | " + c.method + " | " + c.line.substring(0, 120));
     if (pick.best) {
       res.ok = true;
       res.amount = pick.best.amount;
       res.amountNumber = Math.round(pick.best.value * 100) / 100;
       res.line = pick.best.line;
       res.method = pick.best.method;
-      // confidence: rule quality + distance to the next different amount
-      let margin = 99;
-      for (const c of pick.candidates) if (c.value !== pick.best.value) { margin = pick.best.score - c.score; break; }
-      const strongRule = res.method === "keyword" || res.method === "keyword-next-line" || res.method === "column-sum";
-      res.confidence = strongRule && margin >= 1.5 ? "high" : (margin >= 0.75 && res.method !== "largest") ? "medium" : "low";
+      // confidence comes from pickAmount (rule quality, margin, score floors, safety nets);
+      // a low result always carries a short reason for the manual-check mail
+      res.confidence = pick.confidence;
+      if (res.confidence === "low") res.error = "uncertain: " + (pick.reason || "weak signals");
     } else {
       res.error = "no amount pattern found";
     }
+    // ---- extraction quality (extraction part): partial or OCR text never keeps high/medium ----
+    if (res.ok && (ex.ocr || ex.incomplete.length > 0)) {
+      const why: string[] = [];
+      if (ex.ocr) why.push("OCR text layer");
+      if (ex.incomplete.length > 0) why.push("PDF read incompletely (" + ex.incomplete[0] + ")");
+      const prev = res.error.indexOf("uncertain: ") === 0 ? res.error.substring(11) : res.error;
+      res.confidence = "low";
+      res.error = "uncertain: " + why.join("; ") + (prev !== "" ? "; " + prev : "");
+    }
+    // ---- end extraction quality ----
     return res;
   } catch (e) {
     res.error = "exception: " + String(e);
