@@ -6,6 +6,8 @@
 //  page tree -> content streams (FlateDecode, LZW, A85, AHx, RL) ->
 //  font decoding (WinAnsi/MacRoman/Standard/Differences, ToUnicode,
 //  Identity-H, embedded TrueType cmap) -> lines -> amount heuristic.
+//  The input may also be a mail container (S/MIME "smime.p7m", .eml):
+//  the PDF inside is used; the signature is not verified.
 // =====================================================================
 
 // ---------------------------------------------------------------------
@@ -39,14 +41,19 @@ function base64ToBytes(input: string): Uint8Array {
   if (m) s = m[1];
   const comma = s.indexOf(",");
   if (s.substring(0, 5) === "data:" && comma > 0) s = s.substring(comma + 1);
+  return decodeBase64Range(s, 0, s.length);
+}
+
+function decodeBase64Range(s: string, start: number, end: number): Uint8Array {
+  // Base64 digits of s[start, end); other characters (line breaks, '=') are skipped, '-' / '_' are url-safe digits
   const lookup = new Int16Array(256);
   for (let i = 0; i < 256; i++) lookup[i] = -1;
   for (let i = 0; i < 64; i++) lookup[B64_ALPHABET.charCodeAt(i)] = i;
   lookup[45] = 62; // '-' (url-safe)
   lookup[95] = 63; // '_'
-  const out = new Uint8Array(Math.floor((s.length * 3) / 4) + 3);
+  const out = new Uint8Array(Math.floor((Math.max(0, end - start) * 3) / 4) + 3);
   let acc = 0, bits = 0, o = 0;
-  for (let i = 0; i < s.length; i++) {
+  for (let i = start; i < end; i++) {
     const c = s.charCodeAt(i);
     if (c > 255) continue;
     const v = lookup[c];
@@ -61,8 +68,8 @@ function base64ToBytes(input: string): Uint8Array {
   return out.subarray(0, o);
 }
 
-/** bytes -> "latin1" string (one char per byte) */
 function bytesToLatin1(b: Uint8Array, start: number, end: number): string {
+  // bytes -> "latin1" string (one char per byte)
   let s = "";
   const CH = 4096;
   for (let i = start; i < end; i += CH) {
@@ -190,8 +197,8 @@ class ByteSink {
 /** result of a decoder: complete=false when the data ended early or was corrupt (text may be partial) */
 interface Decoded { data: Uint8Array; complete: boolean }
 
-/** inflate raw deflate data starting at `pos`; complete = the final block was decoded to its end */
 function inflateRaw(data: Uint8Array, pos: number): Decoded {
+  // inflate raw deflate data starting at `pos`; complete = the final block was decoded to its end
   const br = new BitReader(data, pos);
   const out = new ByteSink(data.length * 4);
   let last = 0;
@@ -318,10 +325,8 @@ function inflate(data: Uint8Array): Decoded {
   return { data: junk.data, complete: junk.complete || data.length === 0 };
 }
 
-// ---------------------------------------------------------------------
-// Predictors (PNG / TIFF) for FlateDecode & LZWDecode
-// ---------------------------------------------------------------------
 function applyPredictor(data: Uint8Array, predictor: number, colors: number, bpc: number, columns: number): Uint8Array {
+  // Predictors (PNG / TIFF) for FlateDecode & LZWDecode
   if (predictor <= 1) return data;
   const bpp = Math.ceil((colors * bpc) / 8);
   const rowLen = Math.ceil((colors * bpc * columns) / 8);
@@ -364,10 +369,8 @@ function applyPredictor(data: Uint8Array, predictor: number, colors: number, bpc
   return out;
 }
 
-// ---------------------------------------------------------------------
-// Other filters
-// ---------------------------------------------------------------------
 function asciiHexDecode(data: Uint8Array): Uint8Array {
+  // ASCIIHexDecode (the other filters follow: ASCII85, RunLength, LZW)
   const out = new ByteSink(data.length >> 1);
   let digit = -1;
   for (let i = 0; i < data.length; i++) {
@@ -437,8 +440,8 @@ function runLengthDecode(data: Uint8Array): Uint8Array {
   return out.result();
 }
 
-/** LZW; complete = the end-of-data code was reached */
 function lzwDecode(data: Uint8Array, earlyChange: number): Decoded {
+  // LZW; complete = the end-of-data code was reached
   const out = new ByteSink(data.length * 3);
   // no local reset helper: the table is built here once and cut back to 258 entries on a clear code
   const dict: number[][] = [];
@@ -643,8 +646,8 @@ function sha256(data: Uint8Array): Uint8Array {
   return out;
 }
 
-/** SHA-512, or SHA-384 when is384 (same compression, other IV, 48-byte output) */
 function sha512(data: Uint8Array, is384: boolean): Uint8Array {
+  // SHA-512, or SHA-384 when is384 (same compression, other IV, 48-byte output)
   const n = data.length;
   const end = (((n + 16) >>> 7) + 1) * 128;
   const buf = new Uint8Array(end);
@@ -744,11 +747,9 @@ function aesTables(): Int32Array[] {
   return t;
 }
 
-/**
- * AES-CBC (128/192/256-bit key) over data[start..], whole 16-byte blocks only, no padding handling.
- * decrypt=false encrypts (needed by the R6 password hash).
- */
 function aesCbc(key: Uint8Array, iv: Uint8Array, data: Uint8Array, start: number, decrypt: boolean): Uint8Array {
+  // AES-CBC (128/192/256-bit key) over data[start..], whole 16-byte blocks only, no padding handling.
+  // decrypt=false encrypts (needed by the R6 password hash).
   const T = aesTables();
   const sbox = T[4];
   const nk = key.length >> 2;
@@ -823,8 +824,8 @@ function aesCbc(key: Uint8Array, iv: Uint8Array, data: Uint8Array, start: number
   return out;
 }
 
-/** Hash for R5 (plain SHA-256) and R6 (ISO 32000-2 algorithm 2.B) security handlers */
 function pdfPasswordHash(pw: Uint8Array, salt: Uint8Array, udata: Uint8Array, r6: boolean): Uint8Array {
+  // Hash for R5 (plain SHA-256) and R6 (ISO 32000-2 algorithm 2.B) security handlers
   let k = sha256(concatBytes([pw, salt, udata]));
   if (!r6) return k;
   for (let round = 1; round <= 320; round++) {
@@ -844,6 +845,545 @@ function pdfPasswordHash(pw: Uint8Array, salt: Uint8Array, udata: Uint8Array, r6
     if (round >= 64 && e[e.length - 1] <= round - 32) break;
   }
   return k.subarray(0, 32);
+}
+
+// ---------------------------------------------------------------------
+// Mail containers. Exchange stores a signed mail as ONE attachment "smime.p7m":
+// clear-signed = the whole multipart/signed MIME entity as text, opaque-signed =
+// CMS SignedData (DER or BER). The PDFs inside are read without any crypto (the
+// signature is NOT verified). Encrypted S/MIME (CMS EnvelopedData) and Purview-
+// protected mail (message.rpmsg) cannot be read and are only recognised.
+// ---------------------------------------------------------------------
+// container: the input is a mail container (MIME entity, CMS structure or .rpmsg);
+// signed / encrypted / rpmsg: what was seen on the way; parts / berBudget: work limits; extraPdfs: PDFs beyond
+// MAIL_MAX_PDFS (counted, not kept)
+interface MailPdf { name: string; data: Uint8Array }
+interface MailScan { pdfs: MailPdf[]; container: boolean; signed: boolean; encrypted: boolean; rpmsg: boolean; parts: number; berBudget: number; extraPdfs: number }
+// one BER element: tag = first identifier byte, body = first content byte, end = after the element
+// (including the end-of-contents octets of an indefinite length)
+interface BerNode { tag: number; body: number; end: number; indef: boolean }
+// header fields (lower-case names, folded lines joined); bodyStart: first body character; ok: a header block was found
+interface MimeHead { fields: Map<string, string>; bodyStart: number; ok: boolean }
+// a structured header value: "type/subtype" (lower case) and its parameters (lower-case names, raw values)
+interface MimeValue { value: string; params: Map<string, string> }
+
+const OID_PKCS7_DATA = "1.2.840.113549.1.7.1";
+const OID_SIGNED_DATA = "1.2.840.113549.1.7.2";
+const OID_ENVELOPED_DATA = "1.2.840.113549.1.7.3";
+const OID_ENCRYPTED_DATA = "1.2.840.113549.1.7.6";
+const OID_AUTH_ENVELOPED_DATA = "1.2.840.113549.1.9.16.1.23";
+const OID_COMPRESSED_DATA = "1.2.840.113549.1.9.16.1.9";
+const MAIL_MAX_DEPTH = 12;
+const MAIL_MAX_PARTS = 5000;
+const MAIL_MAX_PDFS = 50; // more PDFs are only counted (the duplicate check in mailResult compares every pair)
+
+function decodeQuotedPrintable(s: string, start: number, end: number): Uint8Array {
+  // quoted-printable (RFC 2045): "=XX" is one byte, "=" at the end of a line is a soft line break
+  const out = new Uint8Array(Math.max(0, end - start));
+  let o = 0;
+  for (let i = start; i < end; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== 61) { out[o++] = c & 0xff; continue; }
+    let j = i + 1;
+    while (j < end && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9)) j++;
+    if (j >= end) { i = j; continue; }
+    const n1 = s.charCodeAt(j);
+    if (n1 === 13 || n1 === 10) {
+      i = n1 === 13 && j + 1 < end && s.charCodeAt(j + 1) === 10 ? j + 1 : j;
+      continue;
+    }
+    const c1 = i + 1 < end ? s.charCodeAt(i + 1) : -1, c2 = i + 2 < end ? s.charCodeAt(i + 2) : -1;
+    const h1 = c1 >= 48 && c1 <= 57 ? c1 - 48 : c1 >= 65 && c1 <= 70 ? c1 - 55 : c1 >= 97 && c1 <= 102 ? c1 - 87 : -1;
+    const h2 = c2 >= 48 && c2 <= 57 ? c2 - 48 : c2 >= 65 && c2 <= 70 ? c2 - 55 : c2 >= 97 && c2 <= 102 ? c2 - 87 : -1;
+    if (h1 >= 0 && h2 >= 0) { out[o++] = h1 * 16 + h2; i += 2; }
+    else out[o++] = 61;
+  }
+  return out.subarray(0, o);
+}
+
+function utf8Decode(b: Uint8Array): string {
+  // UTF-8 -> string (used for file names); an invalid sequence gives U+FFFD
+  let out = "";
+  let i = 0;
+  while (i < b.length) {
+    const c = b[i];
+    let cp = 0, n = 0;
+    if (c < 0x80) { cp = c; n = 1; }
+    else if (c >= 0xc2 && c < 0xe0) { cp = c & 0x1f; n = 2; }
+    else if (c >= 0xe0 && c < 0xf0) { cp = c & 0x0f; n = 3; }
+    else if (c >= 0xf0 && c < 0xf5) { cp = c & 0x07; n = 4; }
+    let ok = n > 0 && i + n <= b.length;
+    for (let k = 1; ok && k < n; k++) {
+      const d = b[i + k];
+      if ((d & 0xc0) !== 0x80) ok = false;
+      else cp = cp * 64 + (d & 0x3f);
+    }
+    if (!ok) { out += "�"; i++; continue; }
+    if (cp >= 0x10000) { const v = cp - 0x10000; out += String.fromCharCode(0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff)); }
+    else out += String.fromCharCode(cp);
+    i += n;
+  }
+  return out;
+}
+
+function latin1Utf8(s: string): string {
+  // header text whose raw bytes are UTF-8 (read one char per byte) -> decoded; anything else unchanged
+  let high = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c > 255) return s;
+    if (c >= 128) high = true;
+  }
+  if (!high) return s;
+  const d = utf8Decode(latin1ToBytes(s));
+  return d.indexOf("�") >= 0 ? s : d;
+}
+
+function charsetDecode(b: Uint8Array, charset: string): string {
+  // UTF-8 when the charset says so, else one char per byte (ISO-8859-1 / Windows-1252 / ASCII)
+  const cs = charset.toLowerCase();
+  if (cs.indexOf("utf-8") >= 0 || cs.indexOf("utf8") >= 0) return utf8Decode(b);
+  return bytesToLatin1(b, 0, b.length);
+}
+
+function percentDecode(s: string): Uint8Array {
+  // RFC 2231 value: "%XX" is one byte
+  const out = new Uint8Array(s.length);
+  let o = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 37 && i + 2 < s.length) {
+      const c1 = s.charCodeAt(i + 1), c2 = s.charCodeAt(i + 2);
+      const h1 = c1 >= 48 && c1 <= 57 ? c1 - 48 : c1 >= 65 && c1 <= 70 ? c1 - 55 : c1 >= 97 && c1 <= 102 ? c1 - 87 : -1;
+      const h2 = c2 >= 48 && c2 <= 57 ? c2 - 48 : c2 >= 65 && c2 <= 70 ? c2 - 55 : c2 >= 97 && c2 <= 102 ? c2 - 87 : -1;
+      if (h1 >= 0 && h2 >= 0) { out[o++] = h1 * 16 + h2; i += 2; continue; }
+    }
+    out[o++] = c & 0xff;
+  }
+  return out.subarray(0, o);
+}
+
+function decodeMimeWords(v: string): string {
+  // RFC 2047 encoded words "=?charset?B|Q?text?=" (white space between two words is dropped)
+  let out = "";
+  let p = 0;
+  let lastWord = false;
+  for (let guard = 0; p < v.length && guard < 1000; guard++) {
+    const a = v.indexOf("=?", p);
+    if (a < 0) { out += v.substring(p); break; }
+    const q1 = v.indexOf("?", a + 2);
+    const e = q1 >= 0 && q1 + 2 < v.length && v.charAt(q1 + 2) === "?" ? v.indexOf("?=", q1 + 3) : -1;
+    const enc = q1 >= 0 ? v.charAt(q1 + 1).toUpperCase() : "";
+    if (e < 0 || (enc !== "B" && enc !== "Q")) { out += v.substring(p, a + 2); p = a + 2; lastWord = false; continue; }
+    const gap = v.substring(p, a);
+    if (!lastWord || gap.trim() !== "") out += gap;
+    let cs = v.substring(a + 2, q1);
+    const star = cs.indexOf("*");
+    if (star >= 0) cs = cs.substring(0, star);
+    const txt = v.substring(q1 + 3, e);
+    const bytes = enc === "B" ? decodeBase64Range(txt, 0, txt.length) : decodeQuotedPrintable(txt.split("_").join(" "), 0, txt.length);
+    out += charsetDecode(bytes, cs);
+    p = e + 2;
+    lastWord = true;
+  }
+  return out;
+}
+
+function mimeValue(v: string): MimeValue {
+  // "type/subtype; name=value; name2="quoted value"" -> value + parameters
+  const params = new Map<string, string>();
+  let i = v.indexOf(";");
+  const main = (i < 0 ? v : v.substring(0, i)).trim().toLowerCase();
+  for (let guard = 0; i >= 0 && i < v.length && guard < 200; guard++) {
+    i++;
+    const eq = v.indexOf("=", i);
+    const semi = v.indexOf(";", i);
+    if (eq < 0) break;
+    if (semi >= 0 && semi < eq) { i = semi; continue; }
+    const key = v.substring(i, eq).trim().toLowerCase();
+    let j = eq + 1;
+    while (j < v.length && (v.charCodeAt(j) === 32 || v.charCodeAt(j) === 9)) j++;
+    let val = "";
+    if (j < v.length && v.charCodeAt(j) === 34) {
+      j++;
+      let seg = j;
+      while (j < v.length && v.charCodeAt(j) !== 34) {
+        if (v.charCodeAt(j) === 92 && j + 1 < v.length) { val += v.substring(seg, j); j++; seg = j; }
+        j++;
+      }
+      val += v.substring(seg, j);
+      i = v.indexOf(";", j);
+    } else {
+      const e = v.indexOf(";", j);
+      val = (e < 0 ? v.substring(j) : v.substring(j, e)).trim();
+      i = e;
+    }
+    if (key !== "" && !params.has(key)) params.set(key, val);
+  }
+  return { value: main, params: params };
+}
+
+function mimeParam(mv: MimeValue, name: string): string {
+  // a parameter with RFC 2231 (name*=utf-8''%XX, name*0*= / name*1= sections) and RFC 2047 decoding
+  const p = mv.params;
+  let joined = "";
+  let charset = "";
+  let found = false;
+  for (let k = -1; k < 64; k++) {
+    const enc = p.get(k < 0 ? name + "*" : name + "*" + k + "*");
+    const raw = enc !== undefined ? enc : k < 0 ? undefined : p.get(name + "*" + k);
+    if (raw === undefined) { if (k < 0) continue; break; }
+    found = true;
+    if (enc !== undefined) {
+      let t = enc;
+      if (k <= 0) {
+        const q = t.indexOf("'"), q2 = q >= 0 ? t.indexOf("'", q + 1) : -1;
+        if (q2 > q) { charset = t.substring(0, q); t = t.substring(q2 + 1); }
+      }
+      const b = percentDecode(t);
+      joined += bytesToLatin1(b, 0, b.length);
+    } else joined += raw;
+    if (k < 0) break;
+  }
+  if (found) return charset !== "" ? charsetDecode(latin1ToBytes(joined), charset) : latin1Utf8(joined);
+  const plain = p.get(name);
+  return plain === undefined ? "" : decodeMimeWords(latin1Utf8(plain));
+}
+
+function mimeHeaders(s: string, start: number, end: number): MimeHead {
+  // header block of the entity s[start, end): field lines up to the first empty line
+  const fields = new Map<string, string>();
+  const lim = Math.min(end, start + 65536);
+  let p = start;
+  let curName = "", curVal = "";
+  let count = 0;
+  while (p < lim) {
+    let e = s.indexOf("\n", p);
+    if (e < 0 || e > end) e = end;
+    const le = e > p && s.charCodeAt(e - 1) === 13 ? e - 1 : e;
+    if (le === p) {
+      if (curName !== "" && !fields.has(curName)) fields.set(curName, curVal);
+      return { fields: fields, bodyStart: Math.min(e + 1, end), ok: true };
+    }
+    const c = s.charCodeAt(p);
+    if ((c === 32 || c === 9) && count > 0) {
+      curVal += " " + s.substring(p, le).trim();
+    } else {
+      const colon = s.indexOf(":", p);
+      let good = colon > p && colon < le;
+      for (let k = p; good && k < colon; k++) { const d = s.charCodeAt(k); if (d <= 32 || d >= 127) good = false; }
+      if (!good) {
+        // an mbox "From " line before the headers is tolerated
+        if (count === 0 && s.substring(p, p + 5) === "From ") { p = e + 1; continue; }
+        return { fields: fields, bodyStart: start, ok: false };
+      }
+      if (curName !== "" && !fields.has(curName)) fields.set(curName, curVal);
+      curName = s.substring(p, colon).toLowerCase();
+      curVal = s.substring(colon + 1, le).trim();
+      count++;
+    }
+    p = e + 1;
+  }
+  if (curName !== "" && !fields.has(curName)) fields.set(curName, curVal);
+  return { fields: fields, bodyStart: Math.min(p, end), ok: count > 0 && p >= end };
+}
+
+function mimeParts(s: string, start: number, end: number, boundary: string): number[] {
+  // body parts of a multipart body as [start0, end0, start1, end1, ...]; a part cut off by the end
+  // of the data (no closing delimiter) is kept
+  const out: number[] = [];
+  const delim = "--" + boundary;
+  let p = start;
+  let partStart = -1;
+  for (let guard = 0; p < end && guard < 20000; guard++) {
+    const i = s.indexOf(delim, p);
+    if (i < 0 || i + delim.length > end) break;
+    let j = i + delim.length;
+    if (i !== start && s.charCodeAt(i - 1) !== 10) { p = j; continue; }
+    const close = j + 1 < end && s.charCodeAt(j) === 45 && s.charCodeAt(j + 1) === 45;
+    if (close) j += 2;
+    while (j < end && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9)) j++;
+    if (!close && j < end && s.charCodeAt(j) !== 13 && s.charCodeAt(j) !== 10) { p = i + delim.length; continue; }
+    if (partStart >= 0) {
+      let pe = i;
+      if (pe > partStart && s.charCodeAt(pe - 1) === 10) pe--;
+      if (pe > partStart && s.charCodeAt(pe - 1) === 13) pe--;
+      out.push(partStart, pe);
+    }
+    if (close) return out;
+    if (j < end && s.charCodeAt(j) === 13) j++;
+    if (j < end && s.charCodeAt(j) === 10) j++;
+    partStart = j;
+    p = j;
+  }
+  if (partStart >= 0 && partStart < end) out.push(partStart, end);
+  return out;
+}
+
+function guessBoundary(s: string, start: number, end: number): string {
+  // multipart body without headers: the first "--boundary" line (within 16 KB) that occurs again later
+  let p = start;
+  let tries = 0;
+  for (let lines = 0; p < end && p < start + 16384 && lines < 400 && tries < 8; lines++) {
+    let e = s.indexOf("\n", p);
+    if (e < 0 || e > end) e = end;
+    let le = e;
+    while (le > p && s.charCodeAt(le - 1) <= 32) le--;
+    if (le - p > 2 && le - p <= 202 && s.charCodeAt(p) === 45 && s.charCodeAt(p + 1) === 45) {
+      tries++;
+      const b = s.substring(p + 2, le);
+      const again = s.indexOf("\n--" + b, e);
+      if (b.charCodeAt(0) > 32 && again >= 0 && again < end) return b;
+    }
+    p = e + 1;
+  }
+  return "";
+}
+
+function mimeBody(s: string, start: number, end: number, cte: string): Uint8Array {
+  // body bytes after the Content-Transfer-Encoding
+  if (cte === "base64") return decodeBase64Range(s, start, end);
+  if (cte === "quoted-printable") return decodeQuotedPrintable(s, start, end);
+  return latin1ToBytes(s.substring(start, end));
+}
+
+function berNode(b: Uint8Array, p: number, limit: number, depth: number, st: MailScan): BerNode | null {
+  // one BER/DER element at p (definite or indefinite length); null when malformed or truncated
+  if (depth > 40 || p + 2 > limit || --st.berBudget < 0) return null;
+  const tag = b[p];
+  let q = p + 1;
+  if ((tag & 0x1f) === 0x1f) {
+    while (q < limit && (b[q] & 0x80) !== 0) q++;
+    q++;
+  }
+  if (q >= limit) return null;
+  const l0 = b[q++];
+  if (l0 === 0x80) {
+    if ((tag & 0x20) === 0) return null;
+    let r = q;
+    while (r + 2 <= limit) {
+      if (b[r] === 0 && b[r + 1] === 0) return { tag: tag, body: q, end: r + 2, indef: true };
+      const c = berNode(b, r, limit, depth + 1, st);
+      if (c === null) return null;
+      r = c.end;
+    }
+    return null;
+  }
+  let len = l0;
+  if (l0 > 0x80) {
+    const n = l0 & 0x7f;
+    if (n > 4 || q + n > limit) return null;
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + b[q++];
+  }
+  if (len > limit - q) return null;
+  return { tag: tag, body: q, end: q + len, indef: false };
+}
+
+function berChildren(b: Uint8Array, node: BerNode, st: MailScan): BerNode[] {
+  // the elements inside a constructed element (stops at the first malformed one)
+  const out: BerNode[] = [];
+  const stop = node.indef ? node.end - 2 : node.end;
+  let p = node.body;
+  while (p < stop && out.length < 200000) {
+    const c = berNode(b, p, stop, 0, st);
+    if (c === null) break;
+    out.push(c);
+    p = c.end;
+  }
+  return out;
+}
+
+function berOctets(b: Uint8Array, node: BerNode, st: MailScan, pieces: Uint8Array[], depth: number): boolean {
+  // content of an OCTET STRING: primitive, or constructed from (nested) chunks as BER encoders write it
+  if ((node.tag & 0x20) === 0) { pieces.push(b.subarray(node.body, node.end)); return true; }
+  if (depth > 8) return false;
+  const kids = berChildren(b, node, st);
+  for (const k of kids) if (!berOctets(b, k, st, pieces, depth + 1)) return false;
+  return true;
+}
+
+function berOid(b: Uint8Array, node: BerNode): string {
+  // OBJECT IDENTIFIER -> dotted string
+  let out = "";
+  let v = 0;
+  let first = true;
+  for (let i = node.body; i < node.end && i < node.body + 64; i++) {
+    v = v * 128 + (b[i] & 0x7f);
+    if ((b[i] & 0x80) !== 0) continue;
+    if (first) { const a = v < 80 ? Math.floor(v / 40) : 2; out = a + "." + (v - a * 40); first = false; }
+    else out += "." + v;
+    v = 0;
+  }
+  return out;
+}
+
+function joinPieces(pieces: Uint8Array[]): Uint8Array {
+  // one chunk is used as it is (no copy of a large primitive OCTET STRING)
+  return pieces.length === 1 ? pieces[0] : concatBytes(pieces);
+}
+
+function scanCms(b: Uint8Array, depth: number, st: MailScan): boolean {
+  // b is a CMS ContentInfo (DER or BER): opened and true; false when b is not CMS
+  const root = berNode(b, 0, b.length, 0, st);
+  if (root === null || root.tag !== 0x30) return false;
+  const kids = berChildren(b, root, st);
+  if (kids.length < 1 || kids[0].tag !== 0x06) return false;
+  const oid = berOid(b, kids[0]);
+  if (oid.indexOf("1.2.840.113549.1.") !== 0) return false;
+  st.container = true;
+  let content: BerNode | null = null;
+  if (kids.length > 1 && kids[1].tag === 0xa0) {
+    const ck = berChildren(b, kids[1], st);
+    if (ck.length > 0) content = ck[0];
+  }
+  cmsContent(b, oid, content, depth, st);
+  return true;
+}
+
+function cmsContent(b: Uint8Array, oid: string, node: BerNode | null, depth: number, st: MailScan): void {
+  // content of one CMS type: SignedData / CompressedData / Data are opened, encrypted types only flagged
+  if (oid === OID_ENVELOPED_DATA || oid === OID_AUTH_ENVELOPED_DATA || oid === OID_ENCRYPTED_DATA) { st.encrypted = true; return; }
+  if (node === null || depth > MAIL_MAX_DEPTH) return;
+  let data: Uint8Array | null = null;
+  let innerType = OID_PKCS7_DATA;
+  if (oid === OID_PKCS7_DATA) {
+    const pieces: Uint8Array[] = [];
+    if (berOctets(b, node, st, pieces, 0)) data = joinPieces(pieces);
+  } else if (oid === OID_SIGNED_DATA || oid === OID_COMPRESSED_DATA) {
+    if (oid === OID_SIGNED_DATA) st.signed = true;
+    // both start with: version, digest / compression algorithm(s), encapContentInfo { eContentType, [0] eContent }
+    const sk: BerNode[] = node.tag === 0x30 ? berChildren(b, node, st) : [];
+    if (sk.length < 3 || sk[2].tag !== 0x30) return;
+    const eci = berChildren(b, sk[2], st);
+    if (eci.length < 2 || eci[0].tag !== 0x06 || eci[1].tag !== 0xa0) return; // detached signature: no content
+    innerType = berOid(b, eci[0]);
+    const ek = berChildren(b, eci[1], st);
+    const pieces: Uint8Array[] = [];
+    if (ek.length < 1 || !berOctets(b, ek[0], st, pieces, 0)) return;
+    data = joinPieces(pieces);
+    if (oid === OID_COMPRESSED_DATA) {
+      try { data = inflate(data).data; } catch (e) { return; }
+    }
+  } else return;
+  if (data === null || data.length === 0) return;
+  if (innerType === OID_PKCS7_DATA) { scanMailBytes(data, "", depth + 1, st); return; }
+  // a nested CMS type is encapsulated without its ContentInfo
+  const inner = berNode(data, 0, data.length, 0, st);
+  if (inner !== null) cmsContent(data, innerType, inner, depth + 1, st);
+}
+
+function scanMailBytes(b: Uint8Array, name: string, depth: number, st: MailScan): void {
+  // one decoded body: a PDF, a CMS structure, an .rpmsg file, PEM / base64 text of these, or a MIME entity
+  if (depth > MAIL_MAX_DEPTH || ++st.parts > MAIL_MAX_PARTS || b.length < 4) return;
+  if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) {
+    if (st.pdfs.length < MAIL_MAX_PDFS) st.pdfs.push({ name: name, data: b });
+    else st.extraPdfs++;
+    return;
+  }
+  if (b.length >= 8 && b[0] === 0x76 && b[1] === 0xe8 && b[2] === 0x04 && b[3] === 0x60 && b[4] === 0xc4 && b[5] === 0x11 && b[6] === 0xe3 && b[7] === 0x86) {
+    st.rpmsg = true;
+    st.container = true;
+    return;
+  }
+  if (b[0] === 0x30 && scanCms(b, depth, st)) return;
+  const head = bytesToLatin1(b, 0, Math.min(b.length, 2048));
+  let p = 0;
+  while (p < head.length && head.charCodeAt(p) <= 32) p++;
+  if (head.substring(p, p + 11) === "-----BEGIN ") {
+    const s = bytesToLatin1(b, 0, b.length);
+    const from = s.indexOf("\n", p);
+    const stop = s.indexOf("-----END", p + 11);
+    if (from > 0 && stop > from) scanMailBytes(decodeBase64Range(s, from + 1, stop), name, depth + 1, st);
+    return;
+  }
+  if (head.length - p >= 16 && /^[A-Za-z0-9+\/=\s]+$/.test(head)) {
+    const s = bytesToLatin1(b, 0, b.length);
+    scanMailBytes(decodeBase64Range(s, 0, s.length), name, depth + 1, st);
+    return;
+  }
+  const s = bytesToLatin1(b, 0, b.length);
+  scanMimeEntity(s, 0, s.length, depth, st, true);
+}
+
+function scanMultipart(s: string, start: number, end: number, boundary: string, type: string, depth: number, st: MailScan): void {
+  // body parts of a multipart entity; in multipart/signed only the first part is content (the second is the signature)
+  const parts = mimeParts(s, start, end, boundary);
+  let signed = type === "multipart/signed";
+  if (!signed && type === "" && parts.length >= 4) {
+    const lh = mimeHeaders(s, parts[parts.length - 2], parts[parts.length - 1]);
+    const lct = lh.ok ? (lh.fields.get("content-type") || "").toLowerCase() : "";
+    signed = lct.indexOf("signature") >= 0;
+  }
+  if (signed) st.signed = true;
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    scanMimeEntity(s, parts[i], parts[i + 1], depth + 1, st, false);
+    if (signed) break;
+  }
+}
+
+function scanMimeEntity(s: string, start: number, end: number, depth: number, st: MailScan, top: boolean): void {
+  // a MIME entity in s[start, end); top: also accept a header-less multipart body (preamble / first boundary)
+  if (depth > MAIL_MAX_DEPTH || ++st.parts > MAIL_MAX_PARTS) return;
+  const h = mimeHeaders(s, start, end);
+  const ctRaw = h.ok ? (h.fields.get("content-type") || "") : "";
+  if (ctRaw === "") {
+    if (!top) return;
+    const from = h.ok ? h.bodyStart : start;
+    const bnd = guessBoundary(s, from, end);
+    if (bnd !== "") { st.container = true; scanMultipart(s, from, end, bnd, "", depth, st); }
+    return;
+  }
+  st.container = true;
+  const ct = mimeValue(ctRaw);
+  const type = ct.value;
+  const cte = (h.fields.get("content-transfer-encoding") || "").trim().toLowerCase();
+  let name = mimeParam(mimeValue(h.fields.get("content-disposition") || ""), "filename");
+  if (name === "") name = mimeParam(ct, "name");
+  const lname = name.toLowerCase();
+  const b0 = h.bodyStart;
+  if (type.indexOf("multipart/") === 0) {
+    let bnd = ct.params.get("boundary") || "";
+    if (bnd === "") bnd = guessBoundary(s, b0, end);
+    if (bnd !== "") scanMultipart(s, b0, end, bnd, type, depth, st);
+    return;
+  }
+  if (type === "message/rfc822" || type === "message/global" || lname.endsWith(".eml")) {
+    if (cte === "base64" || cte === "quoted-printable") scanMailBytes(mimeBody(s, b0, end, cte), name, depth + 1, st);
+    else scanMimeEntity(s, b0, end, depth + 1, st, false);
+    return;
+  }
+  if (type === "application/x-microsoft-rpmsg-message" || lname.endsWith(".rpmsg")) { st.rpmsg = true; return; }
+  if (type === "application/pkcs7-mime" || type === "application/x-pkcs7-mime" || lname.endsWith(".p7m")) {
+    const sm = (ct.params.get("smime-type") || "").toLowerCase();
+    if (sm === "enveloped-data" || sm === "authenveloped-data") { st.encrypted = true; return; }
+    scanMailBytes(mimeBody(s, b0, end, cte), name, depth + 1, st);
+    return;
+  }
+  const pdfType = type === "application/pdf" || type === "application/x-pdf" || lname.endsWith(".pdf");
+  if (!pdfType) {
+    // other attachments count only when their content is a PDF ("JVBER" = base64 of "%PDF")
+    let q = b0;
+    while (q < end && s.charCodeAt(q) <= 32) q++;
+    if (type.indexOf("text/") === 0 || s.substring(q, q + (cte === "base64" ? 5 : 4)) !== (cte === "base64" ? "JVBER" : "%PDF")) return;
+  }
+  const data = mimeBody(s, b0, end, cte);
+  // a few junk bytes before the header are tolerated, as for a PDF passed directly
+  const lim = Math.min(data.length - 5, 1024);
+  for (let i = 0; i <= lim; i++) {
+    if (data[i] === 0x25 && data[i + 1] === 0x50 && data[i + 2] === 0x44 && data[i + 3] === 0x46) {
+      if (st.pdfs.length < MAIL_MAX_PDFS) st.pdfs.push({ name: name, data: i > 0 ? data.subarray(i) : data });
+      else st.extraPdfs++;
+      return;
+    }
+  }
+}
+
+function unwrapMail(b: Uint8Array): MailScan {
+  // PDFs inside a mail container (smime.p7m / .eml / base64 or PEM CMS); flags for encrypted / protected mail
+  const st: MailScan = { pdfs: [], container: false, signed: false, encrypted: false, rpmsg: false, parts: 0, berBudget: 4000000, extraPdfs: 0 };
+  scanMailBytes(b, "", 0, st);
+  return st;
 }
 
 // ---- generated tables (encodings as Unicode code points, 0 = undefined) ----
@@ -1032,8 +1572,8 @@ function isNum(o: PObj): o is number { return typeof o === "number"; }
 function mkName(v: string): PName { return { t: "name", v: v }; }
 function mkDict(): PDict { return { t: "dict", m: new Map<string, PObj>() }; }
 
-// character classes
 function isWs(c: number): boolean {
+  // PDF white space (character classes)
   return c === 32 || c === 10 || c === 13 || c === 9 || c === 12 || c === 0;
 }
 function isDelim(c: number): boolean {
@@ -1255,6 +1795,33 @@ interface CryptState {
 
 interface PageRef { dict: PDict; resources: PDict | null; box: number[] }
 
+// keys not followed when collecting what the pages use: back links (P, Parent of annotations / fields),
+// signature and field values, actions, destinations, metadata, thumbnails
+const SIGN_SKIP_KEYS = ["P", "V", "A", "AA", "Dest", "Metadata", "Thumb", "PieceInfo", "B", "SV", "Lock", "Reference", "IRT", "StructParent", "StructParents"];
+
+function samePdfObj(a: PObj, b: PObj, depth: number): boolean {
+  // structural equality of two parsed objects (a stream: its dictionary and its raw data)
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (depth > 40 || a.t !== b.t) return false;
+  if (a.t === "ref") return isRef(b) && a.n === b.n && a.g === b.g;
+  if (a.t === "name" || a.t === "str" || a.t === "kw") return (isName(b) || isStr(b) || isKw(b)) && a.v === b.v;
+  if (a.t === "arr") {
+    if (!isArr(b) || a.v.length !== b.v.length) return false;
+    for (let i = 0; i < a.v.length; i++) if (!samePdfObj(a.v[i], b.v[i], depth + 1)) return false;
+    return true;
+  }
+  const da = a.t === "stream" ? a.d : a.t === "dict" ? a : null;
+  const db = isStream(b) ? b.d : isDict(b) ? b : null;
+  if (da === null || db === null || da.m.size !== db.m.size) return false;
+  if (isStream(a) && (!isStream(b) || a.raw !== b.raw)) return false;
+  for (const [k, v] of Array.from(da.m.entries())) {
+    const w = db.m.get(k);
+    if (w === undefined || !samePdfObj(v, w, depth + 1)) return false;
+  }
+  return true;
+}
+
 const PDF_PASSWORD_PAD = [0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08, 0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a];
 
 // PdfDoc fields:
@@ -1263,6 +1830,8 @@ const PDF_PASSWORD_PAD = [0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 
 //   cryptStatus: none / decrypted / password / certificate / unsupported
 //   incomplete: reasons why the extracted text may be partial
 //   ocOff: optional-content groups that are OFF by default
+//   history: earlier definitions of objects that a later one replaced (incremental updates)
+//   cryptStatus "protected": an unencrypted wrapper around an encrypted payload (ISO 32000-2, e.g. Microsoft Purview)
 class PdfDoc {
   s: string;
   objs: Map<number, ObjEntry>;
@@ -1282,6 +1851,7 @@ class PdfDoc {
   ocOff: Set<PDict>;
   ocUsed: boolean;
   keyCache: Map<string, Uint8Array>;
+  history: Map<number, ObjEntry[]>;
 
   constructor(s: string) {
     this.s = s;
@@ -1302,6 +1872,7 @@ class PdfDoc {
     this.ocOff = new Set<PDict>();
     this.ocUsed = false;
     this.keyCache = new Map<string, Uint8Array>();
+    this.history = new Map<number, ObjEntry[]>();
   }
 
   load(): void {
@@ -1311,6 +1882,7 @@ class PdfDoc {
     if (this.cryptStatus === "none" || this.cryptStatus === "decrypted") {
       this.expandObjectStreams();
       this.loadOptionalContent();
+      if (this.hasEncryptedPayload()) this.cryptFail("protected", "encrypted payload");
     }
     const tail = Math.max(0, this.s.length - 4096);
     if (this.s.indexOf("%%EOF", tail) < 0) this.flagIncomplete("no %%EOF at the end of the file (truncated?)");
@@ -1347,6 +1919,8 @@ class PdfDoc {
           obj = r.stream;
           end = r.end;
         }
+        const prevDef = this.objs.get(num);
+        if (prevDef !== undefined) this.remember(num, prevDef);
         this.objs.set(num, { obj: obj, pos: start, gen: gen });
         // an unbalanced "(" must not swallow the rest of the file: rescan right after the header, or
         // after the first "endobj" when the parse ran past it (a later ")" closed the broken string)
@@ -1616,15 +2190,98 @@ class PdfDoc {
           const lx = new Lexer(text, first + off);
           const obj = lx.parse(0);
           const existing = this.objs.get(onum);
+          const def: ObjEntry = { obj: obj === null || isKw(obj) ? null : obj, pos: st.entry.pos, gen: 0 };
           // position rule: the definition that appears later in the file wins
           if (existing === undefined || existing.pos < st.entry.pos) {
-            this.objs.set(onum, { obj: obj === null || isKw(obj) ? null : obj, pos: st.entry.pos, gen: 0 });
-          }
+            if (existing !== undefined) this.remember(onum, existing);
+            this.objs.set(onum, def);
+          } else this.remember(onum, def);
         }
       } catch (e) {
         this.warnings.push("ObjStm " + st.num + ": " + String(e));
       }
     }
+  }
+
+  private remember(num: number, e: ObjEntry): void {
+    // keeps a replaced definition (needed to tell whether an update after signing changed an object)
+    const h = this.history.get(num);
+    if (h === undefined) this.history.set(num, [e]);
+    else if (h.length < 64) h.push(e);
+  }
+
+  private hasEncryptedPayload(): boolean {
+    // ISO 32000-2 unencrypted wrapper document: the real (encrypted) PDF is an embedded file with
+    // /AFRelationship /EncryptedPayload; the visible page is only a cover sheet
+    for (const e of Array.from(this.objs.values())) {
+      const d = isDict(e.obj) ? e.obj : isStream(e.obj) ? e.obj.d : null;
+      if (d === null) continue;
+      const af = d.m.get("AFRelationship"), ty = d.m.get("Type"), ep = d.m.get("EP");
+      if (af !== undefined && isName(af) && af.v === "EncryptedPayload") return true;
+      if (ty !== undefined && isName(ty) && ty.v === "EncryptedPayload") return true;
+      if (ep !== undefined && isDict(ep)) {
+        const et = ep.m.get("Type");
+        if (et !== undefined && isName(et) && et.v === "EncryptedPayload") return true;
+      }
+    }
+    return false;
+  }
+
+  changedAfterSigning(): string {
+    // A signed PDF with an incremental update after its last signature: names the first object used by the
+    // pages (page tree, content streams, resources, annotations and their appearances) that this update added
+    // or changed, "" when there is none. Updates that only add LTV data (DSS) or touch the catalog pass.
+    const s = this.s;
+    let sigEnd = -1;
+    let p = s.indexOf("/ByteRange");
+    for (let k = 0; p >= 0 && k < 500; k++) {
+      let arr: PObj | null = null;
+      try { arr = new Lexer(s, p + 10).parse(0); } catch (e) { arr = null; }
+      if (arr !== null && isArr(arr) && arr.v.length === 4) {
+        const a = arr.v[0], b = arr.v[1], c = arr.v[2], d = arr.v[3];
+        // a real signature: [0 b c d] around the /Contents hex string, inside the file
+        if (isNum(a) && isNum(b) && isNum(c) && isNum(d) && a === 0 && b > 0 && c > b && d >= 0 && c + d <= s.length &&
+          s.charCodeAt(b) === 60 && s.charCodeAt(c - 1) === 62 && c + d > sigEnd) sigEnd = c + d;
+      }
+      p = s.indexOf("/ByteRange", p + 10);
+    }
+    if (sigEnd < 0) return "";
+    let q = sigEnd;
+    while (q < s.length && q < sigEnd + 256 && s.charCodeAt(q) <= 32) q++;
+    if (q >= s.length) return "";
+    const cat = this.catalog();
+    const pagesRef = cat ? cat.m.get("Pages") : undefined;
+    if (pagesRef === undefined) return "";
+    const stack: PObj[] = [pagesRef];
+    const seen = new Set<number>();
+    for (let guard = 0; stack.length > 0 && guard < 200000; guard++) {
+      const o = stack.pop();
+      if (o === undefined || o === null || typeof o !== "object") continue;
+      if (o.t === "ref") {
+        if (seen.has(o.n) || seen.size > 20000) continue;
+        seen.add(o.n);
+        const e = this.objs.get(o.n);
+        if (e === undefined) continue;
+        if (e.pos >= sigEnd) {
+          let old: ObjEntry | null = null;
+          const hist = this.history.get(o.n);
+          if (hist !== undefined) for (const h of hist) if (h.pos < sigEnd && (old === null || h.pos > old.pos)) old = h;
+          if (old === null || !samePdfObj(old.obj, e.obj, 0)) return "object " + o.n + (old === null ? " added" : " changed");
+        }
+        stack.push(e.obj);
+        continue;
+      }
+      if (o.t === "arr") { for (const x of o.v) stack.push(x); continue; }
+      const d = o.t === "dict" ? o : o.t === "stream" ? o.d : null;
+      if (d === null || d.m.has("ByteRange")) continue; // a signature value is covered by its own signature
+      const ty = d.m.get("Type");
+      const node = ty !== undefined && isName(ty) && (ty.v === "Page" || ty.v === "Pages");
+      for (const [key, val] of Array.from(d.m.entries())) {
+        if (key === "Parent" ? !node : SIGN_SKIP_KEYS.indexOf(key) >= 0) continue;
+        stack.push(val);
+      }
+    }
+    return "";
   }
 
   private loadOptionalContent(): void {
@@ -1920,8 +2577,8 @@ function stringIncrement(s: string, by: number): string {
   return s.substring(0, s.length - 1) + String.fromCharCode(last & 0xffff);
 }
 
-/** mode "uni": destinations are UTF-16BE strings; mode "cid": destinations are integers */
 function parseCMap(text: string, mode: "uni" | "cid"): CMapData {
+  // mode "uni": destinations are UTF-16BE strings; mode "cid": destinations are integers
   const cm: CMapData = { ranges: [], single: new Map<number, string>(), rangeList: [], vertical: false };
   const lx = new Lexer(text, 0);
   const stack: PObj[] = [];
@@ -2002,10 +2659,8 @@ function cmapLookupCid(cm: CMapData, code: number): number {
   return code;
 }
 
-// ---------------------------------------------------------------------
-// Glyph names -> Unicode
-// ---------------------------------------------------------------------
 function glyphNameToUnicode(name: string): string {
+  // Glyph names -> Unicode
   if (name.length === 0) return "";
   const direct = GLYPHS[name];
   if (direct !== undefined) return String.fromCharCode(direct);
@@ -2391,9 +3046,9 @@ function newGState(ctm: Mat): GState {
   return { ctm: ctm, font: null, size: 0, charSp: 0, wordSp: 0, hscale: 1, leading: 0, rise: 0, tr: 0, fa: 1, sa: 1, mask: false, blend: false };
 }
 
-// text that paints nothing: render mode 3/7, or zero alpha for the parts the mode paints
-// (Apple's Vision OCR layer uses an ExtGState with /ca 0 instead of 3 Tr)
 function invisibleText(gs: GState): boolean {
+  // text that paints nothing: render mode 3/7, or zero alpha for the parts the mode paints
+  // (Apple's Vision OCR layer uses an ExtGState with /ca 0 instead of 3 Tr)
   const tr = gs.tr;
   if (tr === 3 || tr === 7) return true;
   const fill = tr === 0 || tr === 2 || tr === 4 || tr === 6, stroke = tr === 1 || tr === 2 || tr === 5 || tr === 6;
@@ -2475,6 +3130,17 @@ class ContentInterpreter {
       const flags = doc.num(ad.m.get("F"), 0);
       if (flags & 34) continue; // Hidden (2) or NoView (32)
       if (doc.isHiddenOC(ad.m.get("OC"))) continue;
+      // signature fields (/FT /Sig on the widget or inherited from a parent field, or a signature value
+      // with /ByteRange): the signature box is not document text and must not mix into the amount lines
+      let ft = doc.nameOf(ad.m.get("FT"));
+      let parent = doc.dictOf(ad.m.get("Parent"));
+      for (let k = 0; ft === "" && parent && k < 16; k++) {
+        ft = doc.nameOf(parent.m.get("FT"));
+        parent = doc.dictOf(parent.m.get("Parent"));
+      }
+      if (ft === "Sig") continue;
+      const sigValue = sub === "Widget" ? doc.dictOf(ad.m.get("V")) : null;
+      if (sigValue && sigValue.m.has("ByteRange")) continue;
       const ap = doc.dictOf(ad.m.get("AP"));
       if (!ap) continue;
       let n = doc.resolve(ap.m.get("N"));
@@ -2526,6 +3192,8 @@ class ContentInterpreter {
       const c0 = g.u.length > 0 ? g.u.charCodeAt(0) : 0;
       if (c0 === 0 || c0 === 0xfffd || (c0 >= 0xe000 && c0 <= 0xf8ff)) noUni++;
     }
+    // some producers (Chrome/Skia) map the space glyph to a line break: keep text runs on one line
+    if (/[\t\n\v\f\r]/.test(text)) text = text.replace(/[\t\n\v\f\r]/g, " ");
     const devW = advance * gs.hscale * scale;
     const devH = Math.abs(gs.size * Math.sqrt(trm[2] * trm[2] + trm[3] * trm[3]) / Math.max(gs.size, 1e-9));
     if (this.ocHidden === 0 && glyphs.length > 0) {
@@ -2780,9 +3448,9 @@ class ContentInterpreter {
   }
 }
 
-// Drops items outside their page box (+ margin) when most items of that page are inside;
-// boxes[i] belongs to page i.
 function dropOffPage(items: TextItem[], boxes: number[][]): TextItem[] {
+  // Drops items outside their page box (+ margin) when most items of that page are inside;
+  // boxes[i] belongs to page i.
   const inside = new Map<number, number>(), outside = new Map<number, number>();
   const flags: boolean[] = [];
   for (const it of items) {
@@ -2807,8 +3475,12 @@ function dropOffPage(items: TextItem[], boxes: number[][]): TextItem[] {
 // ---------------------------------------------------------------------
 // Line assembly
 // ---------------------------------------------------------------------
+// Largest glyph height of every line of the last assembleLines call (0 for a page break); pickAmount uses it to find the title.
+let lastLineHeights: number[] = [];
+
 function assembleLines(items: TextItem[]): string[] {
   const lines: string[] = [];
+  const heights: number[] = [];
   let page = -1;
   // group per page, sort by y desc then x asc
   const byPage = new Map<number, TextItem[]>();
@@ -2822,7 +3494,7 @@ function assembleLines(items: TextItem[]): string[] {
   pageNums.sort((a, b) => a - b);
   for (const pn of pageNums) {
     const arr = byPage.get(pn) as TextItem[];
-    if (page >= 0) lines.push("");
+    if (page >= 0) { lines.push(""); heights.push(0); }
     page = pn;
     // dominant text direction on this page (rotated/landscape text): rotate coordinates back
     const rotCount = [0, 0, 0, 0];
@@ -2863,10 +3535,12 @@ function assembleLines(items: TextItem[]): string[] {
       let prevText = "";
       let prevX = -1e9;
       let h = 0;
+      let maxH = 0;
       for (const it of g) {
         h = Math.max(it.h, 1);
         const t = it.s;
         if (t.length === 0) continue;
+        if (it.h > maxH && t.trim().length > 0) maxH = it.h;
         // duplicated text (fake bold / overprint)
         if (t === prevText && Math.abs(it.x - prevX) < 0.15 * h) continue;
         if (endX > -1e8) {
@@ -2884,9 +3558,10 @@ function assembleLines(items: TextItem[]): string[] {
       let e = line.length;
       while (e > 0 && /\s/.test(line.charAt(e - 1))) e--;
       if (e < line.length) line = line.substring(0, e);
-      if (line.length > 0) lines.push(line);
+      if (line.length > 0) { lines.push(line); heights.push(maxH); }
     }
   }
+  lastLineHeights = heights;
   return lines;
 }
 
@@ -2929,38 +3604,113 @@ interface LineInfo {
   wrapped: string;      // label wrapped around a value-only line ("" if none)
   grossPay: boolean;    // single invoice row under a Netto/USt/Brutto header without payment or deduction column
   payCol: boolean;      // row under a header that has a payment column (Zahlbetrag)
+  quoted: boolean;      // quoted part of an e-mail reply
 }
 
 interface AmountPick { best: Candidate | null; candidates: Candidate[]; currency: string; confidence: string; reason: string }
 
-const STRONG_KEYWORDS = /gesamt|zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|gutschriftsbetrag|endbetrag|endsumme|summe|total|nettobetrag der zahlung|betrag der überweisung|wir überweisen|überwiesen|ueberwiesen|überweisen wir|überweisen ihnen|zahlung in höhe|zahlen wir|wir zahlen|zu zahlen|angewiesen|den betrag von|gutgeschrieben|zu ihren gunsten|betrag der zahlung|überweisung\b|ueberweisung\b|ausgleichsbetrag|gezahlte[rn]? betrag|bezahlte[rn]? betrag|nettozahlung|gutschrift auf ihr konto|remittance total|remittance amount|amount remitted|amount paid|payment amount|net amount paid|net payment|total paid|payment total|check amount|credited amount|amount credited/i;
-// words that mean "what was actually paid" – beat generic totals like "Summe Rechnungsbetrag"
-const PAYMENT_KEYWORDS = /zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlung|gutschriftsbetrag|wir überweisen|überwiesen|ueberwiesen|überweisen wir|überweisen ihnen|zahlung in höhe|zahlen wir|wir zahlen|zu zahlen|angewiesen|den betrag von|gutgeschrieben|zu ihren gunsten|betrag der zahlung|überweisung\b|ueberweisung\b|zahlungssumme|ausgleichsbetrag|gezahlte[rn]? betrag|bezahlte[rn]? betrag|nettozahlung|gutschrift auf ihr konto|remittance total|remittance amount|amount remitted|amount paid|payment amount|net amount paid|net payment|total paid|payment total|check amount|credited amount|amount credited/i;
+// total and payment labels (also NL, FR, IT, ES, PT, PL, CZ, DA/SV totals, "paid" participles and transfer nouns)
+const STRONG_KEYWORDS = /gesamt|zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|auszahlung\b|gutschriftsbetrag|endbetrag|endsumme|summe|total|nettobetrag der zahlung|betrag der überweisung|wir überweisen|überwiesen|ueberwiesen|überweisen wir|überweisen ihnen|zahlung in höhe|zahlen wir|wir zahlen|zu zahlen|angewiesen|den betrag von|gutgeschrieben|zu ihren gunsten|betrag der zahlung|überweisung\b|ueberweisung\b|ausgleichsbetrag|gezahlte[rn]? betrag|bezahlte[rn]? betrag|nettozahlung|gutschrift auf ihr konto|remittance total|remittance amount|amount remitted|amount paid|payment amount|net amount paid|net payment|total paid|payment total|check amount|credited amount|amount credited|transfer amount|amount transferred|we have (?:today )?(?:paid|transferred|remitted)|payment of\b|totaal|celkem|\bi alt\b|totalt|\bsumma\b|\bsuma\b|razem|betaald|overgemaakt|overboeking|réglé|reglé|payé|viré|versé|virement|pagato|bonifico|bonificato|pagado|transferencia|transferido|abonado|valor pago|montante pago|total pago|transferência|przelew|przelano|zapłacono|zapłacona|wpłacono|uregulowano|uhrazen|zaplacen|převedeno|betalt|overført|indbetalt|överfört|utbetalt|nous avons (?:réglé|payé|viré|versé)|wij hebben (?:betaald|overgemaakt)|abbiamo (?:pagato|bonificato|saldato)|hemos (?:pagado|transferido|abonado)|efetu[aá]mos|pagámos|transferimos|uhradili jsme|jsme uhradili|zaplatili jsme|jsme zaplatili|převedli jsme|przelaliśmy|zapłaciliśmy|uregulowaliśmy|vi har (?:betalt|overført|betalat|överfört)|montant (?:du |de )?(?:règlement|reglement|paiement|virement)|importo (?:del )?(?:pagamento|bonifico)|importe (?:del )?(?:pago|transferencia)|bedrag (?:van de )?betaling|kwota (?:płatności|przelewu)|částka (?:platby|úhrady)/i;
+// words that mean "what was actually paid" (also the foreign participles and transfer nouns) – beat generic totals like "Summe Rechnungsbetrag"
+const PAYMENT_KEYWORDS = /zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlung|gutschriftsbetrag|wir überweisen|überwiesen|ueberwiesen|überweisen wir|überweisen ihnen|zahlung in höhe|zahlen wir|wir zahlen|zu zahlen|angewiesen|den betrag von|gutgeschrieben|zu ihren gunsten|betrag der zahlung|überweisung\b|ueberweisung\b|zahlungssumme|ausgleichsbetrag|gezahlte[rn]? betrag|bezahlte[rn]? betrag|nettozahlung|gutschrift auf ihr konto|remittance total|remittance amount|amount remitted|amount paid|payment amount|net amount paid|net payment|total paid|payment total|check amount|credited amount|amount credited|transfer amount|amount transferred|we have (?:today )?(?:paid|transferred|remitted)|payment of\b|betaald|overgemaakt|overboeking|réglé|reglé|payé|viré|versé|virement|pagato|bonifico|bonificato|pagado|transferencia|transferido|abonado|valor pago|montante pago|total pago|transferência|przelew|przelano|zapłacono|zapłacona|wpłacono|uregulowano|uhrazen|zaplacen|převedeno|betalt|overført|indbetalt|överfört|utbetalt|nous avons (?:réglé|payé|viré|versé)|wij hebben (?:betaald|overgemaakt)|abbiamo (?:pagato|bonificato|saldato)|hemos (?:pagado|transferido|abonado)|efetu[aá]mos|pagámos|transferimos|uhradili jsme|jsme uhradili|zaplatili jsme|jsme zaplatili|převedli jsme|przelaliśmy|zapłaciliśmy|uregulowaliśmy|vi har (?:betalt|overført|betalat|överfört)|montant (?:du |de )?(?:règlement|reglement|paiement|virement)|importo (?:del )?(?:pagamento|bonifico)|importe (?:del )?(?:pago|transferencia)|bedrag (?:van de )?betaling|kwota (?:płatności|przelewu)|částka (?:platby|úhrady)/i;
+// explicit label of the transferred amount (the end of a netting): beats computed totals
+const TRANSFER_LABEL = /überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|auszahlbetrag|auszahlung\b|zahlbetrag|zahlungsbetrag|zahlungssumme|überwiesene[rn]? (?:betrag|summe)|gezahlte[rn]? betrag|betrag der überweisung|betrag der zahlung|nettozahlung|amount paid|payment amount|net payment|total paid|amount remitted|remittance (?:amount|total)|transfer amount|amount transferred|check amount|credited amount|amount credited|totaal betaald|betaald bedrag|montant (?:réglé|payé|du virement|viré|versé)|total (?:réglé|payé|pagado|pago)|importo (?:pagato|bonificato|del bonifico)|totale pagato|importe (?:pagado|transferido|de la transferencia)|valor (?:pago|transferido)|montante pago|kwota (?:przelewu|zapłacona|płatności)|zapłacono|uhrazen[áo]|částka platby|zaplacen[áo] částka|betalt beløb|betalt belopp|montant (?:du |de )?(?:règlement|reglement|paiement|virement)|importo (?:del )?(?:pagamento|bonifico)|importe (?:del )?(?:pago|transferencia)|bedrag (?:van de )?betaling|částka úhrady/i;
 // payment verbs that follow the amount in a sentence ("3.454,00 EUR überwiesen")
-const POST_PAYMENT = /überwiesen|ueberwiesen|überweisen|gutgeschrieben|angewiesen|bezahlt|beglichen|ausgeglichen|transferred|remitted|paid\b/i;
+const POST_PAYMENT = /überwiesen|ueberwiesen|überweisen|gutgeschrieben|angewiesen|bezahlt|beglichen|ausgeglichen|transferred|remitted|paid\b|betaald|overgemaakt|réglé|payé|viré|pagato|bonificato|pagado|transferido|zapłacono|przelano|uhrazen|zaplacen|betalt|overført|överfört/i;
 // label nouns that must be followed by an amount (safety net)
 const PAYMENT_LABEL = /zahlbetrag|zahlungsbetrag|überweisungsbetrag|ueberweisungsbetrag|überweisungssumme|auszahlungsbetrag|gutschriftsbetrag|zahlungssumme|betrag der zahlung|payment amount|amount paid|net payment|total paid|credited amount|amount credited/i;
 // running totals and balances are no payment, even when worded like one ("Saldo zu Ihren Gunsten", "bisher überwiesen")
 const CUMULATIVE = /(?:saldo|guthaben|kontostand)[^.]{0,25}zu ihren gunsten|\bbisher\b/i;
 const YEAR_TO_DATE = /year to date|\bytd\b|laufenden jahr|kumuliert/i;
-const WEAK_KEYWORDS = /betrag|zahlung|überweisung|ueberweisung|amount|payment/i;
-const NEGATIVE_KEYWORDS = /skonto|abzug|abzgl|abzüglich|\.\/\.|einbehalt|gebühr|spesen|rabatt|discount|steuer|mwst|ust\b|vat\b|rechnungsbetrag|rechnungssumme|bruttobetrag|brutto|netto\b|offener|offene|restbetrag|fällig|iban|bic\b|datum|belegnr|beleg-?nr|rechnungsnr|rechnungs-?nummer|kundennr|kunden-?nummer|lieferantennr|seite|page|telefon|tel\.|fax|steuernummer|ust-id|blz|zwischensumme|subtotal|zinsen|mahn|kontostand|saldo|kapital|capital|kreditlimit|guthaben|kurs\b|umrechnung|exchange rate|gross amount|invoice amount|total invoice|instructed amount|charges|gewicht|menge/i;
+// earlier payments named in a label ("bereits gezahlt", "1. Rate (bereits überwiesen am 15.09.)") and unpaid amounts
+const PRIOR = /\bbereits\b|\bschon\b|already|previously|prior payment|déjà|\breeds\b|\bgià\b|\bya\b|\bjiž\b|\bjuż\b|allerede|\bredan\b/i;
+const PRIOR_PAID = /gezahlt|bezahlt|überwiesen|ueberwiesen|beglichen|angewiesen|zahlung|paid|payment|betaald|payé|réglé|pagat|pagad|zapłac|uhrazen|zaplacen|betalt/i;
+const SENTENCE_VERB = /\b(?:wir|haben|hat|habe|wurde|wurden|we|have|has|nous|avons|wij|hebben|abbiamo|hemos)\b/i;
+const NOT_PAID = /obetal|ikke betalt|niet betaald|onbetaald|non pagat|impagad|no pagad|nezaplacen|neuhrazen|niezapłac|impayé|non réglé|unpaid|unbezahlt|nicht bezahlt/i;
+const WEAK_KEYWORDS = /betrag|zahlung|überweisung|ueberweisung|amount|payment|bedrag|betaling|montant|paiement|importo|pagamento|importe|\bpago\b|valor|kwota|płatnoś|částka|platba|úhrada|beløb|belopp|betalning|règlement|reglement/i;
+const NEGATIVE_KEYWORDS = /skonto|abzug|abzgl|abzüglich|\.\/\.|einbehalt|gebühr|spesen|rabatt|discount|steuer|mwst|(?:^|[^a-zäöüß])ust(?![a-zäöüß])|(?:^|[^a-z])vat(?![a-z])|rechnungsbetrag|rechnungssumme|bruttobetrag|brutto|netto\b|offener|offene|restbetrag|fällig|iban|bic\b|datum|belegnr|beleg-?nr|rechnungsnr|rechnungs-?nummer|kundennr|kunden-?nummer|lieferantennr|seite|page|telefon|tel\.|fax|steuernummer|ust-id|blz|zwischensumme|subtotal|zinsen|mahn|kontostand|saldo|kapital|capital|kreditlimit|guthaben|kurs\b|umrechnung|exchange rate|gross amount|invoice amount|total invoice|instructed amount|charges|gewicht|menge|übertrag|uebertrag|\bvortrag|carried forward|brought forward|seitensumme|summe seite|delkredere|bonus|provision|aufrechn|bauabzug|quellensteuer|withholding|factuurbedrag|montant (?:de la )?facture|montant ttc|importo (?:della )?fattura|importe (?:de la )?factura|kwota faktury|částka faktury|fakturabeløb|fakturabelopp|korting|escompte|remise|sconto|descuento|\brabat\b|sleva|\bbtw\b|\btva\b|\biva\b|\bbruto\b|\bbrut\b|lordo|retenue|ritenuta|retención|à payer|a payer|te betalen|da pagare|a pagar|do zapłaty|k úhradě|k zaplacení|at betale|att betala|amount due|balance due|total due/i;
 // deduction labels for the total - deduction = payment chain
-const DEDUCTION_KEYWORDS = /skonto|abzug|abzgl|abzüglich|\.\/\.|einbehalt|gebühr|spesen|rabatt|discount|kürzung|minderung|verrechn|gutschrift(?!sbetrag|sanzeige| auf)|credit note|less\b|charges/i;
+const DEDUCTION_KEYWORDS = /skonto|abzug|abzgl|abzüglich|\.\/\.|einbehalt|gebühr|spesen|rabatt|discount|kürzung|minderung|verrechn|aufrechn|gutschrift(?!sbetrag|sanzeige| auf)|credit note|less\b|charges|delkredere|bonus|provision|bauabzug|quellensteuer|withholding|zuschuss|rückvergütung|kostenbeteiligung|korting|escompte|remise|sconto|descuento|\brabat\b|sleva|retenue|ritenuta|retención|potrącen|srážka|fradrag|avdrag/i;
 const UNIT_AFTER = /^\s?(?:kg|g|t|to|st|stk|stck|stück|pal|paletten|m|m2|m3|qm|cbm|l|ltr|liter|km|std|min|%|prozent|pct|pcs|pc|ea|lbs?)(?![A-Za-zÄÖÜäöüß0-9])/i;
 const UNIT_AFTER_H = /^\s?h(?![A-Za-zÄÖÜäöüß0-9])/; // hours, lower case only
-const NUMBER_LABEL_BEFORE = /(?:nr|no|rg|re|rechnung|pos|position|beleg|invoice|inv|art|artikel|kd|kunde|anzahl|menge|stk|stück|#)\.?:?\s*$/i;
+// (a whole word, except "nr" as in "Rechnungsnr." - "zapłacono" / "uhrazeno" are no "No.")
+const NUMBER_LABEL_BEFORE = /(?:nr|(?:^|[^a-zäöüßà-ž])(?:no|rg|re|rechnung|pos|position|beleg|invoice|inv|art|artikel|kd|kunde|anzahl|menge|stk|stück)|#)\.?:?\s*$/i;
 const CURRENCY_TOKEN = /\b(?:EUR|CHF|USD|GBP|PLN|CZK|SEK|DKK|NOK|HUF|RON|BGN|JPY|CNY|CAD|AUD|TRY)\b|€|\$|£|¥|zł|Kč|\b[Ee][Uu][Rr][Oo]\b|\bSFr\b|\bFr\.(?= ?\d)/g;
-const PAYMENT_MARKER = /zahlung|zahlbetrag|\bzahlen|gezahlt|bezahlt|überw|ueberw|gutschrift|gutgeschrieben|ausgleich|beglichen|begleichen|skonto|payment|remittance|\bpaid\b|remitted|auszahlung|credited|credit advice|incoming payment/i;
-const NON_PAYMENT_MARKER = /lieferschein|lieferavis|versandavis|versandanzeige|avisierung|anlieferung|despatch advice|dispatch advice|delivery note|lastschrift|mandatsreferenz|pre-?notification|einziehen|zahlungserinnerung|\bmahnung|angebot\b|angebotssumme|auftragsbestätigung|auftragsbestaetigung|order confirmation|pro-?forma|abschlagsrechnung|teilrechnung|schlussrechnung|kostenvoranschlag|quotation/i;
-// title of a payment advice: the document checks below trust it
-const AVIS_TITLE = /zahlungsavis|payment advice|remittance advice|zahlungsmitteilung|gutschriftsanzeige/i;
+const PAYMENT_MARKER = /zahlung|zahlbetrag|\bzahlen|gezahlt|bezahlt|überw|ueberw|gutschrift|gutgeschrieben|ausgleich|beglichen|begleichen|skonto|payment|remittance|\bpaid\b|remitted|auszahlung|credited|credit advice|incoming payment|check no|check date|check amount|cheque|pay to the order/i;
+// payment words of other languages: they count only together with a payer statement ("nous avons réglé"), because
+// foreign bank statements, payslips and bills use them too
+const FOREIGN_PAYMENT_MARKER = /betaling|betaald|overgemaakt|paiement|règlement|reglement|réglé|virement|payé|pagamento|bonifico|pagato|\bpago\b|pagado|transferencia|transferência|płatnoś|przelew|zapłac|wpłat|plat[be]|úhrad|uhrazen|zaplacen|betalt|betalning|overført|överför/i;
+// non-payment documents named anywhere in the text (when no advice title is found)
+const NON_PAYMENT_MARKER = /lieferschein|lieferavis|versandavis|versandanzeige|avisierung|anlieferung|despatch advice|dispatch advice|delivery note|lastschrift|mandatsreferenz|pre-?notification|einziehen|zahlungserinnerung|\bmahnung|angebotssumme/i;
+// title of a payment advice: the document checks below trust it (a title in another language only together with a
+// payment statement: "avviso di pagamento" / "aviso de pago" are also bills)
+const DE_EN_AVIS_TITLE = /zahlungsavis|payment advice|remittance advice|zahlungsmitteilung|gutschriftsanzeige|zahlungsfreigabe|auszahlungsmitteilung|auszahlungsanzeige|regulierungsmitteilung|regulierungsschreiben|schadenregulierung|schadenabrechnung|entschädigungsabrechnung|überweisungsavis|ueberweisungsavis|zahlungsbenachrichtigung|zahlungsanzeige|vergütungsanzeige|verguetungsanzeige|payment notification/i;
+const AVIS_TITLE = /zahlungsavis|payment advice|remittance advice|zahlungsmitteilung|gutschriftsanzeige|zahlungsfreigabe|auszahlungsmitteilung|auszahlungsanzeige|regulierungsmitteilung|regulierungsschreiben|schadenregulierung|schadenabrechnung|entschädigungsabrechnung|überweisungsavis|ueberweisungsavis|zahlungsbenachrichtigung|zahlungsanzeige|vergütungsanzeige|verguetungsanzeige|payment notification|avis de (?:paiement|virement|règlement|reglement)|betalingsadvies|betalingsbericht|avviso di (?:pagamento|bonifico)|aviso de (?:pago|transferencia|pagamento)|awizo (?:płatności|przelewu|zapłaty)|potwierdzenie (?:płatności|przelewu)|avízo o platbě|platební avízo|oznámení o (?:platbě|úhradě)|betalingsadvis|betalingsavis|betalningsavi/i;
+// title of a bank transfer form (order confirmation of the payer's bank, "Avis zur SEPA-Überweisung")
+const TRANSFER_TITLE = /überweisung|ueberweisung|ausführungsbestätigung|zahlungsauftrag|payment order|wire transfer|transfer confirmation|credit transfer|virement|bonifico|transferencia|przelew|převod/i;
+const TRANSFER_FIELD = /^(?:betrag|überweisungsbetrag|ueberweisungsbetrag|auftragsbetrag|amount|transfer amount|montant|importo|importe|kwota|částka)\s*(?:\(?(?:eur|chf|usd|gbp|€)\)?)?\s*:?\s*(?:eur|chf|usd|gbp|€)?\s*$/i;
+// fields of a bank posting (two of them make a "Gutschrift" a bank credit, not a supplier credit note)
+const BANK_FIELD = /buchungstag|buchungsdatum|valuta|wertstellung|auftraggeber|ordering customer|value date|begünstigter|beneficiary|zahlungsempfänger|\bempfänger\b|empfänger-iban|iban empfänger/gi;
+// other document types in the title area (first lines of page 1, larger font)
+const OTHER_TITLE = /mahnung|zahlungserinnerung|zahlungsaufforderung|letzte aufforderung|forderungsaufstellung|inkassoauftrag|inkassoforderung|mahnbescheid|vollstreckungsbescheid|zahlungsbefehl|payment reminder|reminder\b|overdue|final notice|dunning|\brappel\b|relance|herinnering|aanmaning|sollecito|recordatorio de pago|requerimiento de pago|wezwanie do zapłaty|upomnienie|upomínka|výzva k (?:úhradě|zaplacení)|rykker|påminnelse|påmindelse|stornorechnung|\bstorno\b|rechnungskorrektur|korrekturrechnung|angebot|quotation|\bquote\b|kostenvoranschlag|kostenangebot|\bofferte\b|\bdevis\b|preventivo|presupuesto|nabídka|auftragsbestätigung|auftragsbestaetigung|order confirmation|bestellbestätigung|bestätigung ihrer bestellung|purchase order|bestellschreiben|einkaufsbestellung|bon de commande|orden de compra|ordine d'acquisto|versandbestätigung|versandmitteilung|shipping confirmation|shipment notification|ist unterwegs|wurde versandt|has (?:been )?shipped|lieferschein|lieferavis|versandavis|delivery note|packing list|packliste|arrival notice|notice of arrival|ankunftsmeldung|ankunftsavis|avis d'arrivée|container arrival|bill of lading|frachtbrief|verzollungsavis|zollavis|zollanmeldung|abgabenmitteilung|einfuhrabgaben|zollbescheid|customs (?:clearance|entry|notice|invoice)|import duty|pro-?forma|abschlagsrechnung|teilrechnung|schlussrechnung|vorauszahlungsrechnung|anzahlungsrechnung|gehaltsabrechnung|entgeltabrechnung|lohnabrechnung|verdienstabrechnung|bezügemitteilung|bezügeabrechnung|brutto[/-]netto|lohn- und gehalt|payslip|pay slip|salary (?:statement|slip)|earnings statement|reisekostenabrechnung|reisekosten|spesenabrechnung|travel expense|expense (?:report|claim)|kontoauszug|account statement|bank statement|statement of account|saldenbestätigung|saldenabstimmung|saldenmitteilung|(?:kreditkarten|firmenkarten)abrechnung|abrechnung ihrer (?:firmen)?kreditkarte|ihrer firmenkreditkarte|credit card statement|preisliste|price list|allgemeine (?:geschäfts|verkaufs|liefer|einkaufs)|geschäftsbedingungen|terms and conditions|abholavis|benachrichtigungskarte|nachnahme|zahlungsplan|abschlagsplan|tilgungsplan|ratenplan|lastschrift|vorabankündigung|pre-?notification|rückgabe|rücküberweisung|rückbuchung|zurückgegeben|nicht ausgeführt|abgelehnt|returned|rejected|überweisungsträger|überweisungsvordruck|zahlschein|einzahlungsschein|zahlteil|empfangsschein|payment slip|relevé de compte|relevé bancaire|estratto conto|extracto de cuenta|extracto bancario|rekeningafschrift|bankafschrift|wyciąg bankowy|wyciąg z rachunku|výpis z účtu|bankovní výpis|kontoudtog|kontoutdrag|bulletin de (?:paie|salaire)|fiche de paie|cedolino|busta paga|\bnómina\b|loonstrook|salarisstrook|mise en demeure|ingebrekestelling|pagopa|avis d'échéance|avis de prélèvement/i;
+// a title word right after one of these refers to another document ("Zahlung zu Ihrer Schlussrechnung")
+const REF_BEFORE = /(?:\b(?:ihre?[rsmn]?|unsere?[rsmn]?|zu[rm]?|gem(?:äß|\.)|gemaess|lt\.?|laut|bezug|betreff|betr\.?|für|your|our|re|regarding|per|ref\.?)|(?:zahlung|ausgleich|begleichung|überweisung|regulierung|auszahlung|payment|settlement)(?:\s+(?:zu[rm]?|für|auf|der|des|von|of|for))?)(?:\s*\d{1,2}\.)?[\s:]*$/i;
+// documents a payer cites as the reference of a payment ("Lieferschein-Nr.", subject "Lieferschein 80012345"):
+// outside a stand-alone title they do not make the document another type when the payer states the payment
+const REF_DOC = /^(?:lieferschein|delivery note|auftragsbestätigung|auftragsbestaetigung|order confirmation|abschlagsrechnung|teilrechnung|schlussrechnung)$/i;
+const DELIVERY_REF = /lieferschein|delivery note/gi;
+const ORDER_CONFIRM = /auftragsbestätigung|auftragsbestaetigung|order confirmation/i;
+// invoice or credit note as the title line ("RECHNUNG", "Fattura n. 118/2026", "Gutschrift Nr. GS-4711")
+const ORDER_START = /^(?:bestellung|einkaufsbestellung|purchase order|order|bon de commande|commande|bestelling|inkooporder|ordine|pedido|orden de compra|zamówienie|objednávka|bestilling|indkøbsordre|beställning|inköpsorder)(?![a-zà-ž])/i;
+const INVOICE_START = /^(?:rechnung|rechnungskopie|invoice|tax invoice|faktura|facture|factuur|fattura|factura|fatura|duplikat|duplicate)(?![a-zà-ž])/i;
+// amount-due labels of invoices ("Net à payer", "Totale da pagare", "Amount due")
+const DUE_LABEL = /zu zahlen|zahlbar|amount due|balance due|total due|à payer|a payer|te betalen|da pagare|a pagar|do zapłaty|k úhradě|k zaplacení|at betale|att betala/i;
+const CREDIT_TITLE = /^(?:gutschrift|lieferantengutschrift|gutschriftsrechnung|credit note|credit memo|creditnota|avoir|nota di credito|nota de crédito|dobropis|kreditnota|faktura korygująca)(?:(?:\s*-?\s*(?:nr\.?|no\.?|n°|nummer|number|#)|\s*:)?\s*(?=[\w\/.-]*\d)[A-Z0-9][\w\/.-]*)?$/i;
+// credit notes listed in their own block ("Gutschriften", "Gutschrift GS-0007 238,00")
+const CREDIT_WORD = /gutschrift(?!sbetrag|sanzeige| auf| aus| erfolgt| sollte| wird)|credit note|credit memo|creditnota|\bavoir\b|nota di credito|nota de crédito|dobropis|kreditnota/i;
+const CREDIT_SECTION = /^\s*(?:ihre |unsere |abzgl\.? |abzüglich |\.\/\. )?(?:gutschriften|gutschrift|credit notes?|credit memos?|creditnota'?s?|avoirs?|note di credito|notas de crédito)\s*:?\s*$/i;
+// the document naming itself ("Rückfragen zu diesem Zahlungsavis", "queries regarding this remittance advice"): removed
+// before REQUEST_ADVICE is tested
+const SELF_ADVICE = /\b(?:dies(?:e[mnrs]?)?|this|our|unser(?:e[mnrs]?)?)\s+(?:zahlungsavis|avis|remittance(?:\s+advice)?|payment advice)\b/gi;
+// the writer asks for a payment advice (dunning letter, reply of the payee): never an advice itself
+const REQUEST_ADVICE = /(?:senden|schicken|übermitteln|übersenden|mailen|faxen|reichen) sie (?:uns )?(?:bitte )?[^.]{0,60}(?:zahlungsavis|zahlungsnachweis|überweisungsbeleg|überweisungsnachweis)|(?:zahlungsavis|\bavis) (?:fehlt|liegt (?:uns )?nicht vor)|kein(?:e|en)? (?:zahlungsavis|\bavis\b)(?![^.]{0,40}(?:wollen|möchten|mehr\b))[^.]{0,30}(?:vor\b|erhalten)|(?:please|kindly) (?:send|provide|forward|e-?mail)(?: us)?(?![^.]{0,60}(?:quer|question|enquir|inquir))[^.]{0,60}(?:remittance|payment advice|proof of payment)|remittance advice (?:is )?missing|zahlungsavise? bitte (?:an|per|via)\s|veuillez (?:nous )?(?:envoyer|transmettre|faire parvenir)[^.]{0,60}avis/i;
+// the writer wants to be paid (dunning letters, invoices, claims)
+const DEMAND = /bitte (?:überweisen|zahlen|begleichen|bezahlen) sie|(?:überweisen|zahlen|begleichen|bezahlen) sie (?:bitte|den|diesen|die)\b|bitte gleichen sie (?:den|diesen|einen|die summe|die forderung)\b(?![^.]{0,60}(?:buchhaltung|büchern|offenen posten))|bitte um (?:überweisung|zahlung|begleichung|ausgleich)|wir bitten (?:sie )?um (?:begleichung|ausgleich|überweisung|zahlung|umgehende)|fordern (?:wir )?sie[^.]{0,40}auf|(?:please|kindly) (?:pay|remit|settle|transfer|arrange payment)\b|payment is due|veuillez (?:régler|payer|virer)|gelieve[^.]{0,30}(?:te betalen|over te maken)|si prega di (?:pagare|saldare|effettuare il pagamento)|(?:le )?rogamos (?:abone|abonen|pague|paguen)|prosimy o (?:zapłatę|uregulowanie|wpłatę|przelew)|prosíme o (?:úhradu|zaplacení)|venligst betal|vänligen betala/i;
+const DUNNING = /sollten sie (?:die|den|diese|diesen)? ?(?:zahlung|betrag|rechnung|forderung|gesamtbetrag|rechnungsbetrag)[^.]{0,60}(?:bereits|zwischenzeitlich|inzwischen)|(?:if|in case) you have already (?:paid|made|sent|settled|remitted)|keinen zahlungseingang|letzte (?:zahlungs)?aufforderung|\bin verzug\b/i;
+// the document says no money is transferred (credit note to be offset, cancellation)
+const NO_PAYMENT = /(?:auszahlung|überweisung|zahlung)(?: oder überweisung)? (?:erfolgt|ist) nicht|eine zahlung ist nicht erforderlich|keine (?:auszahlung|zahlung) erforderlich|no payment (?:is )?(?:required|will be made)|will be (?:offset|deducted) (?:against|from) (?:your )?(?:next|future)|mit (?:ihrer|der) nächsten rechnung verrechnet/i;
+// payroll / travel expense / shipping vocabulary (two or three of them make the document type)
+const PAYROLL_WORD = /lohnsteuer|sozialversicherung|rentenversicherung|krankenversicherung|steuerklasse|kirchensteuer|solidaritätszuschlag|gesetzliche abzüge|personalnummer|national insurance|income tax|gross pay|net pay/gi;
+const EXPENSE_WORD = /verpflegungsmehraufwand|kilometerpauschale|übernachtung|reisezweck|reiseziel|dienstreise|per diem|mileage|reiseantritt/gi;
+const SHIPPING_WORD = /\bvessel\b|\bvoyage\b|\beta\b|container|b\/l\b|port of (?:loading|discharge)|demurrage|terminal handling|freight|schiff|reederei|löschhafen/gi;
+// payer's statement of a payment ("wir haben ... überwiesen", "we have paid")
+const PAYER_STATEMENT = /(?:wir haben|haben wir|wurde|wurden|wird|werden)[^.]{0,80}(?:überwiesen|ueberwiesen|angewiesen|bezahlt|beglichen|ausgeglichen|gutgeschrieben)|(?:überweisen|zahlen|begleichen) wir|anbei (?:erhalten sie )?(?:die|unsere) zahlung|zahlung (?:für|zu) (?:ihre[rn]? )?rechnung|we have (?:today )?(?:paid|transferred|remitted|released|made|settled)|has been (?:paid|transferred|remitted|settled)|payment (?:has been|was) (?:made|sent|released|initiated)|nous avons (?:réglé|payé|viré|effectué)|wij hebben[^.]{0,40}(?:betaald|overgemaakt)|abbiamo[^.]{0,40}(?:pagato|bonificato|effettuato)|hemos[^.]{0,40}(?:pagado|transferido|realizado)|(?:jsme|uhradili|zaplatili)[^.]{0,40}(?:uhradili|zaplatili|převedli|jsme)|(?:przelaliśmy|zapłaciliśmy|uregulowaliśmy|dokonaliśmy)|vi har[^.]{0,40}(?:betalt|overført|betalat|överfört)|(?:efetu[aá]mos|pagámos|transferimos)/i;
+// first-person statement of a completed payment ("wir haben ... überwiesen", also across "1.204,00"); invoices and
+// orders say "wird ... bezahlt"
+const PAYER_DONE = /(?:wir haben|haben wir)(?:[^.]|\.(?=\d)){0,80}(?:überwiesen|ueberwiesen|angewiesen|bezahlt|beglichen|ausgeglichen)|we have (?:today )?(?:paid|transferred|remitted|settled)/i;
+// an open amount or a direct debit next to a foreign advice title ("Aviso de pago pendiente", pagoPA "Avviso di
+// pagamento", "hemos realizado el cargo en su cuenta")
+const FOREIGN_OPEN = /pendiente|pendente|in sospeso|data limite|fecha límite|date limite|pagopa|codice avviso|prélèvement|domiciliación|domiciliazione|addebito|\bcargo\b|adeudo|\bincasso\b|obciążen|inkas|débito|si ya ha pagado|già pagato|déjà (?:payé|réglé)|\breeds betaald|\bal betaald/i;
+// netting words anywhere in the text: a single amount is then not trusted blindly
+const NETTING_TEXT = /skonto|abzug|abzgl|abzüglich|einbehalt|kürzung|gekürzt|minderung|verrechn|aufrechn|teilzahlung|teilbetrag|\brate\b|raten|restbetrag|differenz|discount|deduct|withh|partial|instal|\bless\b|korting|escompte|sconto|descuento|delkredere|bonus/i;
+const SALUTATION = /^\s*(?:sehr geehrte|liebe[rs]? |hallo\b|guten tag|grüß gott|dear\b|hello\b|hi\b|geachte|beste\b|madame|monsieur|messieurs|gentile|egregi|estimad|prezad|szanown|vážen|dobrý den|kære|hej\b|bonjour|buongiorno)/i;
+const MAIL_HEADER = /^\s*(?:von|from|an|to|cc|gesendet|sent|datum|date|betreff|subject|objet|onderwerp|oggetto|asunto|temat|předmět|emne|ämne)\s*:/i;
+const MAIL_FROM = /^\s*(?:von|from|de|van|da|od|fra|från)\s*:/i;
+const MAIL_SUBJECT = /^\s*(?:betreff|subject|objet|onderwerp|oggetto|asunto|temat|předmět|emne|ämne)\s*:\s*/i;
+const REPLY_PREFIX = /^\s*(?:aw|re|antw|sv|vs|odp|r)\s*:/i;
+const QUOTE_MARK = /^\s*(?:-{2,}\s*(?:original|ursprüngliche|weitergeleitete|forwarded|message transféré|mensaje original)|(?:am|on|le|el|il|op|dne|den)\s.{4,120}(?:schrieb|wrote|a écrit|escribió|ha scritto|schreef|napsal|skrev)\s*:?\s*$|>\s?\S)/i;
+// reference to an invoice or credit note in a label (an itemised line)
+const ITEM_REF = /rechnung|invoice|faktur|factur|fattura|factuur|beleg|gutschrift|credit|\bre[- .]?\d|\brg\.?\s?\d/i;
+const PAY_START = /^\s*(?:zahlung|überweisung|ueberweisung|auszahlung|payment|betaling|paiement|virement|pagamento|bonifico|pago|transferencia|platba|płatność|przelew|betalning)\b/i;
+const PAY_NOUN = /^(?:zahlung|überweisung|ueberweisung|auszahlung|payment|betaling|paiement|virement|pagamento|bonifico|pago|transferencia|platba|płatność|przelew|betalning)\s*:?\s*(?:eur|chf|usd|€)?\s*$/i;
+const TOTAL_WORD = /gesamt|summe|total|insgesamt|totaal|celkem|totale/i;
+const FUTURE_WORD = /nächste|naechste|kommende|künftig|voraussichtlich|geplant|\bnext\b|future|planned|scheduled/i;
 const INVOICE_HEAD = /^\s*(?:rechnung|rechnungskopie|kopie der rechnung|invoice|faktura)\b/i;
-const VAT_LINE = /zzgl|mwst|ust\b|ust\.|umsatzsteuer|mehrwertsteuer|\bvat\b/i;
+const VAT_LINE = /zzgl|mwst|(?:^|[^a-zäöüß])ust(?![a-zäöüß])|umsatzsteuer|mehrwertsteuer|(?:^|[^a-z])(?:vat|tva|btw|iva|dph|moms|mva)(?![a-z])/i;
 const GROUP_MARK = "\u0001";
 
-// Normalizes one text line: Unicode spaces/ligatures (NFKC), group separators, split amounts, letter spacing.
 function normalizeLine(line: string): string {
+  // Normalizes one text line: Unicode spaces/ligatures (NFKC), group separators, split amounts, letter spacing.
   // group separators between digits (no-break, thin, narrow, figure spaces, apostrophes) – before NFKC turns them into spaces
   let s = line.replace(/(\d)[\u00A0\u2007\u2008\u2009\u200A\u202F'\u2019\u02BC\u00B4`](?=\d{3}(?!\d))/g, "$1" + GROUP_MARK);
   s = s.normalize("NFKC").replace(/\u2212/g, "-").replace(/\t/g, " ");
@@ -3011,8 +3761,8 @@ function normalizeLine(line: string): string {
   return s;
 }
 
-// Removes single spaces inside matches of re that start at a number boundary.
 function glueSpaced(s: string, re: RegExp): string {
+  // Removes single spaces inside matches of re that start at a number boundary.
   if (s.indexOf(" ") < 0) return s;
   let out = "", last = 0;
   let m: RegExpExecArray | null;
@@ -3046,8 +3796,8 @@ function parseEnglishAmount(a: string): number {
   return neg ? -v : v;
 }
 
-// Number format of the whole document from unambiguous matches (dates and times removed first).
 function detectEnglishFormat(lines: string[]): boolean {
+  // Number format of the whole document from unambiguous matches (dates and times removed first).
   let de = 0, en = 0;
   for (const ln of lines) {
     if (!/\d[.,]\d/.test(ln)) continue;
@@ -3084,8 +3834,8 @@ function findAmountsInLine(line: string, english: boolean): AmountMatch[] {
   return out;
 }
 
-// Keyword classes of a label segment. afterAmount: the segment follows another amount on the same line.
 function segmentLabel(seg: string, extra: RegExp | null, afterAmount: boolean): LabelInfo {
+  // Keyword classes of a label segment. afterAmount: the segment follows another amount on the same line.
   let s = seg;
   if (afterAmount) {
     // "3.454,00 EUR überwiesen (Skonto 70,49 EUR)": the verb belongs to the previous amount
@@ -3096,7 +3846,9 @@ function segmentLabel(seg: string, extra: RegExp | null, afterAmount: boolean): 
     }
   }
   const lab: LabelInfo = { strong: STRONG_KEYWORDS.test(s), payment: PAYMENT_KEYWORDS.test(s), weak: WEAK_KEYWORDS.test(s), neg: NEGATIVE_KEYWORDS.test(s), ded: DEDUCTION_KEYWORDS.test(s) };
-  if (lab.payment && (YEAR_TO_DATE.test(s) || (CUMULATIVE.test(s) && !PAYMENT_LABEL.test(s)))) { lab.payment = false; lab.neg = true; }
+  if (lab.payment && (YEAR_TO_DATE.test(s) || (CUMULATIVE.test(s) && !PAYMENT_LABEL.test(s)) || NOT_PAID.test(s))) { lab.payment = false; lab.neg = true; }
+  // an earlier payment in a label ("bereits gezahlt", "1. Rate (bereits überwiesen am 15.09.)") reduces the amount; not in a sentence of the payer
+  if (PRIOR.test(s) && PRIOR_PAID.test(s) && !SENTENCE_VERB.test(s)) { lab.payment = false; lab.strong = false; lab.neg = true; lab.ded = true; }
   if (extra !== null && extra.test(s)) { lab.strong = true; lab.payment = true; }
   return lab;
 }
@@ -3107,21 +3859,23 @@ function hasWords(s: string): boolean {
   return /[A-Za-zÄÖÜäöüß]{2,}/.test(t);
 }
 
-// Column class of a table header cell.
 function headerCellClass(cell: string): string {
+  // Column class of a table header cell.
   const c = cell.toLowerCase();
-  if (/datum|date|nr\b|nr\.|nummer|number|no\.|währung|waehrung|currency|kurs|text|bezeichnung|artikel|material|referenz|reference|gewicht|menge|einheit|^pos/.test(c)) return "id";
-  if (/rest|offen|open|outstanding|balance|saldo/.test(c)) return "rest";
-  if (/skonto|abzug|discount|einbehalt|rabatt|deduction|gutschrift/.test(c)) return "ded";
-  if (/ust\b|ust\.|mwst|vat\b|steuer|tax/.test(c)) return "vat";
-  if (/zahlbetrag|zahlungsbetrag|zahlung|gezahlt|bezahlt|überw|ueberw|auszahl|paid|payment|remit/.test(c)) return "pay";
+  if (/datum|date|fecha|\bdata\b|nr\b|nr\.|nummer|number|no\.|n°|währung|waehrung|currency|devise|kurs|text|bezeichnung|artikel|material|referenz|reference|référence|riferimento|referencia|gewicht|menge|einheit|^pos/.test(c)) return "id";
+  // an earlier payment ("bereits gezahlt", "previously paid") is no payment column
+  if (/bereits|already|previously|prior|bisher|déjà|reeds|già|\bya\b|již|już|allerede|redan/.test(c)) return "prev";
+  if (/rest|offen|open|outstanding|balance|saldo|solde|resto|pendiente|zbývá|pozostał/.test(c)) return "rest";
+  if (/skonto|abzug|discount|einbehalt|rabatt|deduction|gutschrift|delkredere|bonus|provision|gebühr|\bfees?\b|commission|aufrechn|verrechn|korting|escompte|remise|sconto|descuento|rabat|sleva|retenue|ritenuta|retención|withholding|bauabzug/.test(c)) return "ded";
+  if (/ust\b|ust\.|mwst|vat\b|steuer|tax|btw|tva|\biva\b|dph/.test(c)) return "vat";
+  if (/zahlbetrag|zahlungsbetrag|zahlung|gezahlt|bezahlt|überw|ueberw|auszahl|paid|payment|remit|betaald|betaling|réglé|payé|paiement|virement|pagato|pagamento|bonifico|pagado|\bpago\b|transferencia|płatno|zapłac|przelew|uhrazen|platba|úhrad|betalt|betalning/.test(c)) return "pay";
   if (/netto|\bnet\b/.test(c)) return "net";
-  if (/brutto|gross|betrag|amount|summe|total|wert|value|preis|price/.test(c)) return "gross";
+  if (/brutto|gross|betrag|amount|summe|total|wert|value|preis|price|bedrag|montant|importo|importe|valor|kwota|částka|beløb|belopp|bruto|brut\b/.test(c)) return "gross";
   return "id";
 }
 
-// Cells of a line separated by 2+ spaces: [start, end) pairs.
 function lineCells(text: string): number[] {
+  // Cells of a line separated by 2+ spaces: [start, end) pairs.
   const out: number[] = [];
   const re = /\S+(?: \S+)*/g;
   let m: RegExpExecArray | null;
@@ -3129,8 +3883,8 @@ function lineCells(text: string): number[] {
   return out;
 }
 
-// Maps table rows to the amount columns of the nearest header line (Rechnungsbetrag / Skonto / Zahlbetrag ...).
 function mapTableColumns(infos: LineInfo[]): void {
+  // Maps table rows to the amount columns of the nearest header line (Rechnungsbetrag / Skonto / Zahlbetrag ...).
   for (let h = 0; h < infos.length; h++) {
     const hd = infos[h];
     if (hd.amounts.length > 0 || hd.text.length === 0) continue;
@@ -3148,6 +3902,12 @@ function mapTableColumns(infos: LineInfo[]): void {
       if (k === "pay") hasPay = true;
       if (k === "ded") hasDed = true;
       if (k === "vat") hasVat = true;
+    }
+    // header on two lines ("bereits | diese" over "gezahlt | Zahlung"): the first of two payment columns is the earlier payment
+    let pays = 0;
+    for (let c = 0; c < n; c++) if (cls[c] === "pay") pays++;
+    if (pays >= 2 && h > 0 && infos[h - 1].amounts.length === 0 && /bereits|already|previously|bisher|prior/i.test(infos[h - 1].text)) {
+      for (let c = 0; c < n; c++) if (cls[c] === "pay") { cls[c] = "prev"; break; }
     }
     for (let c = 0; c < n; c++) {
       if (cls[c] === "net") cls[c] = hasDed && !hasVat && !hasPay ? "pay" : "gross";
@@ -3196,13 +3956,13 @@ function mapTableColumns(infos: LineInfo[]): void {
   }
 }
 
-// Marks lines of appended invoice copies (heading "Rechnung ..." followed by a VAT line with an amount).
 function markInvoiceCopies(infos: LineInfo[]): void {
+  // Marks lines of appended invoice copies (heading "Rechnung ..." followed by a VAT line with an amount).
   let avisPage = false; // a payment advice title earlier on the same page
   for (let i = 0; i < infos.length; i++) {
     if (infos[i].text.length === 0) avisPage = false;
     else if (AVIS_TITLE.test(infos[i].text)) avisPage = true;
-    if (infos[i].amounts.length > 0 || !INVOICE_HEAD.test(infos[i].text)) continue;
+    if (infos[i].amounts.length > 0 || infos[i].header || !INVOICE_HEAD.test(infos[i].text)) continue;
     let end = i + 1;
     let vat = false, ded = false;
     while (end < infos.length && infos[end].text.length > 0 && !(infos[end].amounts.length === 0 && INVOICE_HEAD.test(infos[end].text))) {
@@ -3221,13 +3981,13 @@ function newCandidate(a: AmountMatch, line: string, lineIdx: number, pos: number
   return { amount: a.text, value: a.value, score: 0, line: line, lineIdx: lineIdx, method: "largest", pos: pos, charIdx: a.index, label: label, lineLabel: false, ownLabel: false, confirmed: false, copy: false, risky: false, col: "" };
 }
 
-// Total T, deduction D, payment P with |T - |D| - P| < 0.015 -> prefer P, demote T.
-function deductionChain(all: Candidate[], infos: LineInfo[], candAt: Candidate[][]): void {
+function deductionChain(all: Candidate[], infos: LineInfo[], candAt: Candidate[][], pairs: number[]): void {
+  // Total T, deduction D, payment P with |T - |D| - P| < 0.015 -> prefer P, demote T. pairs receives (P, T) values.
   const ts: Candidate[] = [];
   const ps: Candidate[] = [];
   const ds: Candidate[] = [];
   for (const c of all) {
-    const isDed = (c.label.ded && !c.label.payment) || c.col === "ded";
+    const isDed = (c.label.ded && !c.label.payment) || c.col === "ded" || c.col === "prev";
     if (isDed) { if (c.value !== 0) ds.push(c); continue; }
     if (c.value <= 0) continue;
     if (c.label.strong && !c.label.payment && c.method !== "keyword-next-line") ts.push(c);
@@ -3286,6 +4046,8 @@ function deductionChain(all: Candidate[], infos: LineInfo[], candAt: Candidate[]
   }
   if (payValues.length === 0) return;
   if (payValues.length === 1) {
+    pairs.push(payValues[0]);
+    pairs.push(totValues[0]);
     for (const c of all) {
       if (Math.abs(c.value - payValues[0]) < 0.005 && (!c.label.neg || c.label.payment)) {
         c.score += 3;
@@ -3301,8 +4063,8 @@ function deductionChain(all: Candidate[], infos: LineInfo[], candAt: Candidate[]
   for (const c of all) if (Math.abs(c.value - sum) < 0.015 && (c.label.strong || c.method === "column-sum")) { c.score += 2; c.confirmed = true; }
 }
 
-// Currency token closest to the amount in its line, else in the line, else the document's most frequent one.
 function chooseCurrency(best: Candidate | null, infos: LineInfo[], valueLine: string): { code: string; competing: boolean; codes: string } {
+  // Currency token closest to the amount in its line, else in the line, else the document's most frequent one.
   const counts: { [k: string]: number } = {};
   const order: string[] = [];
   let anyCode = "";
@@ -3353,11 +4115,235 @@ function currencyCode(tok: string): string {
 
 function emptyInfo(text: string): LineInfo {
   const none: LabelInfo = { strong: false, payment: false, weak: false, neg: false, ded: false };
-  return { text: text, amounts: [], labels: [], lineLabel: [], own: [], cols: [], pcts: [], label: none, header: false, risky: false, payBonus: false, copy: false, wrapped: "", grossPay: false, payCol: false };
+  return { text: text, amounts: [], labels: [], lineLabel: [], own: [], cols: [], pcts: [], label: none, header: false, risky: false, payBonus: false, copy: false, wrapped: "", grossPay: false, payCol: false, quoted: false };
 }
 
 function downgrade(conf: string): string {
   return conf === "high" ? "medium" : "low";
+}
+
+function nettingChain(infos: LineInfo[], candAt: Candidate[][], pairs: number[]): void {
+  // Box "Rechnungsbetrag 48.300,00 / Delkredere 966,00 / Bonus 724,50 / Zahlbetrag 46.609,50": the first amount minus the
+  // deduction lines between equals the last one -> the last one is what was paid. Every line in between is a labelled
+  // deduction or a negative amount; all are single-amount lines. pairs receives (paid, first) values.
+  for (let p = 2; p < infos.length; p++) {
+    if (candAt[p].length !== 1) continue;
+    const pc = candAt[p][0];
+    if (pc.value <= 0 || !pc.ownLabel || pc.copy || (pc.label.ded && !pc.label.payment) || (pc.label.neg && !pc.label.payment)) continue;
+    // unlabelled lines in between ("ZR-Kondition 966,00") only when the last line is worded as a payment
+    const plbl = labelOf(pc, infos);
+    const payWord = (pc.label.payment || PAY_START.test(plbl)) && !ITEM_REF.test(plbl);
+    let dsum = 0, dn = 0, plain = 0, plainSum = 0;
+    for (let t = p - 1; t >= 0 && t >= p - 8; t--) {
+      const row = candAt[t];
+      if (row.length === 0) { if (infos[t].text.length === 0 || infos[t].header) break; continue; }
+      if (row.length !== 1) break;
+      const c = row[0];
+      if (c.copy || !c.ownLabel) break;
+      const isDed = (c.label.ded && !c.label.payment) || c.value < 0 || c.col === "ded" || c.col === "prev";
+      if (isDed) { dsum += Math.abs(c.value); dn++; continue; }
+      if (dn >= 1 && c.value > pc.value && Math.abs(c.value - dsum - pc.value) < 0.015 && (plain === 0 || plainSum < 0.5 * c.value)) {
+        if (!pc.confirmed) pc.score += 3;
+        pc.confirmed = true;
+        if (pc.method === "largest" || pc.method === "keyword-weak") pc.method = "deduction";
+        c.score -= 2;
+        pairs.push(pc.value);
+        pairs.push(c.value);
+        break;
+      }
+      // a plain amount line may be an unlabelled deduction ("ZR-Kondition 966,00"), up to three of them; an invoice line
+      // ("Rechnung 4711 4.000,00") makes the block an itemisation instead
+      if (!payWord || c.value <= 0 || c.label.strong || c.label.payment || plain >= 3 || ITEM_REF.test(labelOf(c, infos))) break;
+      dsum += c.value;
+      plainSum += c.value;
+      dn++;
+      plain++;
+    }
+  }
+}
+
+function labelOf(c: Candidate, infos: LineInfo[]): string {
+  // Label text of a candidate: the text before the amount (back to the previous amount), the label line of a
+  // keyword-next-line candidate, or the wrapped label.
+  const inf = infos[c.lineIdx];
+  if (c.pos < 0) { const k = c.line.indexOf(" | "); return k >= 0 ? c.line.substring(0, k) : c.line; }
+  if (inf.wrapped !== "") return inf.wrapped;
+  const start = c.pos > 0 ? inf.amounts[c.pos - 1].end : 0;
+  return inf.text.substring(start, c.charIdx);
+}
+
+function isTransferCand(c: Candidate, infos: LineInfo[]): boolean {
+  // An amount with an explicit transfer label of its own ("Überweisungsbetrag 3.454,00"), not a table cell.
+  if (c.value <= 0 || c.copy || !c.ownLabel || !c.label.payment || (c.label.ded && !c.label.payment)) return false;
+  if (infos[c.lineIdx].amounts.length > 2) return false;
+  return TRANSFER_LABEL.test(labelOf(c, infos));
+}
+
+function dueWithVat(infos: LineInfo[], end: number): boolean {
+  // An "amount due" line and a VAT line with amounts (an invoice) before line end.
+  let due = false, vat = false;
+  for (let i = 0; i < end; i++) {
+    const inf = infos[i];
+    if (inf.amounts.length === 0) continue;
+    if (DUE_LABEL.test(inf.text)) due = true;
+    if (VAT_LINE.test(inf.text)) vat = true;
+  }
+  return due && vat;
+}
+
+function integerCurrencyAmount(s: string): boolean {
+  // A currency amount without decimals ("1.000 EUR", "€ 500"): a value that findAmountsInLine does not read.
+  const re = /(\d[\d.,']*) ?(?:EUR(?![A-Za-z])|€|CHF(?![A-Za-z]))|(?:EUR|€|CHF) ?(\d[\d.,']*)/gi;
+  let m: RegExpExecArray | null;
+  let n = 0;
+  while ((m = re.exec(s)) !== null && n < 200) {
+    n++;
+    let num = m[1] || m[2] || "";
+    if (/[.,]$/.test(num)) num = num.substring(0, num.length - 1);
+    if (num.length === 0 || /[.,]\d\d$/.test(num)) continue;
+    // dates, years and numbered references are no amounts ("vom 29.10.2026 EUR", "2026 EUR", "Nr. 4711 EUR")
+    if (/\d[.\/-]\d{1,2}[.\/-]\d/.test(num) || /^(?:19|20)\d\d$/.test(num)) continue;
+    if (m[1] && NUMBER_LABEL_BEFORE.test(s.substring(Math.max(0, m.index - 14), m.index))) continue;
+    // exchange rates ("Kurs 1 EUR = 1,0700 USD", "1 USD = 0,9346 EUR") are no amounts
+    if (/^\s*=/.test(s.substring(m.index + m[0].length)) || /=\s*$/.test(s.substring(Math.max(0, m.index - 3), m.index)) || /[.,]\d{4,}$/.test(num)) continue;
+    return true;
+  }
+  return false;
+}
+
+function distinctMatches(re: RegExp, s: string): number {
+  // Number of different matches of a global regex in s (at most 10).
+  const seen: string[] = [];
+  re.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null && seen.length < 10) {
+    const k = m[0].toLowerCase();
+    if (seen.indexOf(k) < 0) seen.push(k);
+  }
+  re.lastIndex = 0;
+  return seen.length;
+}
+
+// Document type. kind "advice": advice title in the title area, bank credit or bank transfer form; "other": another
+// document type (why = reason text); "": unknown. quoteStart: first line of the quoted mail in an e-mail reply
+// (lines.length if none); payer: the writer states a payment; foreignPayer: payer and no open amount (foreign payment
+// words then count as payment wording); ownText: the text before the quoted mail.
+interface DocInfo { kind: string; why: string; transferForm: boolean; quoteStart: number; payer: boolean; foreignPayer: boolean; ownText: string }
+
+function classifyDocument(infos: LineInfo[], heights: number[] | null): DocInfo {
+  const n = infos.length;
+  const doc: DocInfo = { kind: "", why: "", transferForm: false, quoteStart: n, payer: false, foreignPayer: false, ownText: "" };
+  // e-mail printout: a header block near the top; a later "Von:" block or "Am ... schrieb" starts the quoted mail
+  // (the first block of header lines; one other line in between is allowed)
+  let headers = 0, lastHeader = -1;
+  for (let i = 0; i < n && i < 15; i++) {
+    if (MAIL_HEADER.test(infos[i].text)) { headers++; lastHeader = i; }
+    else if (headers > 0 && i - lastHeader > 1) break;
+  }
+  const email = headers >= 2;
+  for (let i = email ? lastHeader + 1 : 1; i < n; i++) {
+    const t = infos[i].text;
+    let q = QUOTE_MARK.test(t);
+    if (!q && email && MAIL_FROM.test(t)) {
+      for (let k = i + 1; k <= i + 4 && k < n && !q; k++) if (MAIL_HEADER.test(infos[k].text)) q = true;
+    }
+    if (q) { doc.quoteStart = i; break; }
+  }
+  if (doc.quoteStart < n) {
+    // a forwarded mail without amounts of its own: the quoted part is the document
+    let ownAmount = false;
+    for (let i = 0; i < doc.quoteStart && !ownAmount; i++) if (infos[i].amounts.length > 0 && !MAIL_HEADER.test(infos[i].text)) ownAmount = true;
+    if (!ownAmount) doc.quoteStart = n;
+  }
+  const parts: string[] = [];
+  for (let i = 0; i < doc.quoteStart; i++) if (!(email && MAIL_HEADER.test(infos[i].text))) parts.push(infos[i].text);
+  const own = parts.join("\n");
+  doc.ownText = own;
+  doc.payer = PAYER_STATEMENT.test(own);
+  // a title in another language ("Avis de paiement") counts only with a payment statement and no open amount (bills,
+  // direct debit notices and reminders use the same titles)
+  const openAmount = FOREIGN_OPEN.test(own) || DUE_LABEL.test(own) || DEMAND.test(own) || NOT_PAID.test(own);
+  doc.foreignPayer = doc.payer && !openAmount;
+  const foreignTitleOk = (doc.payer || POST_PAYMENT.test(own)) && !openAmount;
+  // title area: page 1 (before a quoted mail) up to the salutation or the first table header (at most 25 lines), plus
+  // lines in a larger font
+  let pageEnd = doc.quoteStart;
+  for (let i = 0; i < pageEnd; i++) if (infos[i].text.length === 0) { pageEnd = i; break; }
+  const zone: number[] = [];
+  const large: number[] = [];
+  for (let i = 0; i < pageEnd && i < 25; i++) {
+    if (i > 0 && (SALUTATION.test(infos[i].text) || infos[i].header)) break;
+    zone.push(i);
+  }
+  if (heights !== null) {
+    const hs: number[] = [];
+    for (let i = 0; i < pageEnd; i++) if (heights[i] > 0) hs.push(heights[i]);
+    hs.sort((a, b) => a - b);
+    const med = hs.length > 0 ? hs[Math.floor(hs.length / 2)] : 0;
+    for (let i = 0; i < pageEnd && i < 45; i++) {
+      if (med <= 0 || heights[i] < 1.3 * med || infos[i].text.length > 80) continue;
+      large.push(i);
+      if (zone.indexOf(i) < 0) zone.push(i);
+    }
+  }
+  // otherWeak: otherT is only an invoice or order number line ("Rechnung Nr. 2026-551", "DUPLIKAT") or a cited
+  // document outside a stand-alone title ("Lieferschein-Nr.", subject "Lieferschein 80012345")
+  let adviceT = false, transferT = false, creditT = false, otherT = "", otherWeak = false;
+  for (const i of zone) {
+    let t = infos[i].text;
+    let reply = false, subject = false;
+    if (email && MAIL_HEADER.test(t)) {
+      const sm = MAIL_SUBJECT.exec(t);
+      if (sm === null) continue;
+      t = t.substring(sm[0].length);
+      subject = true;
+      reply = REPLY_PREFIX.test(t); // the subject of a reply is the title of the other party's mail
+    }
+    const cells = lineCells(t);
+    // a title line has no amount ("Kostenvoranschlag der Werkstatt   2.645,00" is a field); a section word right above
+    // amount rows ("Rechnung" / "RE-0917   1.000,00") is no title unless it is printed larger
+    if (infos[i].amounts.length > 0 && !subject) continue;
+    const section = i + 1 < n && infos[i + 1].amounts.length > 0 && large.indexOf(i) < 0;
+    for (let c = 0; c + 1 < cells.length; c += 2) {
+      const cell = t.substring(cells[c], cells[c + 1]);
+      if (cell.length > 60) continue;
+      if (AVIS_TITLE.test(cell) && (DE_EN_AVIS_TITLE.test(cell) || foreignTitleOk)) adviceT = true;
+      if (TRANSFER_TITLE.test(cell)) transferT = true;
+      // invoice and credit note titles stand alone on their line ("Rechnung   RE-4711" is a field) or in a larger font
+      // (a mail subject "Rechnung 2026-551" refers to the invoice)
+      const alone = !subject && !section && (cells.length === 2 || large.indexOf(i) >= 0);
+      if (alone && CREDIT_TITLE.test(cell)) creditT = true;
+      if ((otherT !== "" && !otherWeak) || reply) continue;
+      const m = OTHER_TITLE.exec(cell);
+      if (m !== null && !REF_BEFORE.test(cell.substring(0, m.index))) {
+        const weak = !alone && REF_DOC.test(m[0]);
+        if (otherT === "" || !weak) { otherT = m[0]; otherWeak = weak; }
+      }
+      else if (otherT === "" && alone && cell.length <= 50 && (INVOICE_START.test(cell) || ORDER_START.test(cell)) && !/\d[.,]\d\d(?![\d.])/.test(cell) && !PAYMENT_MARKER.test(cell) && !FOREIGN_PAYMENT_MARKER.test(cell)) { otherT = cell; otherWeak = true; }
+    }
+  }
+  const bank = distinctMatches(BANK_FIELD, own) >= 2;
+  if (REQUEST_ADVICE.test(own.replace(SELF_ADVICE, " "))) { doc.kind = "other"; doc.why = "asks for a payment advice - not an advice itself"; return doc; }
+  if (adviceT) doc.kind = "advice";
+  else if (transferT && bank && (otherT === "" || ORDER_CONFIRM.test(otherT))) doc.kind = "advice";
+  else if (creditT && bank) doc.kind = "advice";
+  else if (creditT) { doc.kind = "other"; doc.why = "credit note title - not a payment advice?"; }
+  // an invoice / order number line or a cited document in a payer's letter ("wir haben ... überwiesen") is a reference
+  else if (otherT !== "" && !(otherWeak && PAYER_DONE.test(own))) { doc.kind = "other"; doc.why = "'" + otherT + "' - not a payment advice?"; }
+  else if (AVIS_TITLE.test(own) && (DE_EN_AVIS_TITLE.test(own) || foreignTitleOk)) doc.kind = "advice";
+  else {
+    let m = NO_PAYMENT.exec(own);
+    if (m === null) m = DEMAND.exec(own);
+    if (m === null) m = DUNNING.exec(own);
+    if (m === null) m = NON_PAYMENT_MARKER.exec(PAYER_DONE.test(own) ? own.replace(DELIVERY_REF, " ") : own);
+    if (m !== null) { doc.kind = "other"; doc.why = "'" + m[0] + "' - not a payment advice?"; }
+    else if (!PAYER_DONE.test(own) && dueWithVat(infos, doc.quoteStart)) { doc.kind = "other"; doc.why = "amount due with VAT - invoice?"; }
+    else if (distinctMatches(PAYROLL_WORD, own) >= 2) { doc.kind = "other"; doc.why = "payroll words - not a payment advice?"; }
+    else if (distinctMatches(EXPENSE_WORD, own) >= 2) { doc.kind = "other"; doc.why = "travel expense words - not a payment advice?"; }
+    else if (distinctMatches(SHIPPING_WORD, own) >= 3) { doc.kind = "other"; doc.why = "shipping words - not a payment advice?"; }
+  }
+  doc.transferForm = doc.kind === "advice" && transferT && bank;
+  return doc;
 }
 
 function pickAmount(lines: string[], extraKeywords: string): AmountPick {
@@ -3391,7 +4377,7 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
       inf.own.push(j > 0 && own);
       inf.lineLabel.push(j === 0 || !own);
       let lab: LabelInfo;
-      if (j === 0 || own) lab = segmentLabel(pre, extra, j > 0);
+      if (j === 0 || own) lab = segmentLabel(pre, extra, j > 0 && sv < 0);
       else { const l0 = inf.labels[0]; lab = { strong: l0.strong, payment: l0.payment, weak: l0.weak, neg: l0.neg, ded: l0.ded }; }
       if (!lab.payment && (j === 0 || own)) {
         // payment verb after the amount: "Wir haben 3.454,00 EUR überwiesen"
@@ -3424,11 +4410,11 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
     if (lead.length <= 40 && POST_PAYMENT.test(lead) && !NEGATIVE_KEYWORDS.test(lead)) { lab.payment = true; lab.strong = true; lab.neg = false; lab.ded = false; }
   }
   mapTableColumns(infos);
-  markInvoiceCopies(infos);
   // table headers written with single spaces ("Rechnung   Datum Betrag Skonto Zahlbetrag")
   for (const inf of infos) {
     if (inf.amounts.length === 0 && !inf.header && (inf.text.match(/datum|date|betrag|skonto|rechnung|beleg|amount|invoice|discount/gi) || []).length >= 3) inf.header = true;
   }
+  markInvoiceCopies(infos);
   // label wrapped around its value in a narrow column: "Überwei-" / "3.454,00 €" / "sungsbetrag"
   for (let i = 1; i + 1 < infos.length; i++) {
     const inf = infos[i];
@@ -3442,6 +4428,16 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
     inf.labels[0] = segmentLabel(joined, extra, false);
     inf.label = inf.labels[0];
     inf.wrapped = joined;
+  }
+  // ---- document type (title area, strong phrases), quoted e-mail part, bank transfer forms
+  const doc = classifyDocument(infos, lastLineHeights.length === lines.length ? lastLineHeights : null);
+  for (let i = doc.quoteStart; i < infos.length; i++) infos[i].quoted = true;
+  if (doc.transferForm) {
+    // "Betrag 1.850,00 EUR" in the payer bank's transfer confirmation is the transferred amount
+    for (const inf of infos) {
+      if (inf.amounts.length !== 1 || inf.quoted) continue;
+      if (TRANSFER_FIELD.test(inf.text.substring(0, inf.amounts[0].index).trim())) { inf.labels[0].strong = true; inf.labels[0].payment = true; inf.labels[0].weak = true; }
+    }
   }
 
   // ---- candidates
@@ -3460,7 +4456,7 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
       c.ownLabel = inf.wrapped !== "" || (j === 0 ? hasWords(inf.text.substring(0, a.index)) : inf.own[j]);
       c.col = inf.cols[j];
       c.risky = inf.risky && c.col !== "";
-      c.copy = inf.copy;
+      c.copy = inf.copy || inf.quoted;
       let score = 0;
       if (lab.strong) { score += 5; c.method = "keyword"; }
       else if (lab.weak) { score += 1.5; c.method = "keyword-weak"; }
@@ -3470,16 +4466,16 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
         if (c.method === "largest" || c.method === "keyword-weak") c.method = "column-header";
       } else if (lab.payment) score += 1.5;
       if (lab.neg && !lab.payment) score -= 2;
-      if (c.col === "ded" || c.col === "rest" || c.col === "vat") score -= 2;
+      if (c.col === "ded" || c.col === "rest" || c.col === "vat" || c.col === "prev") score -= 2;
       if (c.col === "gross" && inf.payBonus) score -= 0.5;
       if (c.lineLabel && j === k - 1 && (c.col === "" || c.col === "pay")) score += 0.5; // right-most amount on the line
       const around = inf.text.substring(Math.max(0, a.index - 6), Math.min(inf.text.length, a.end + 6));
       if (/€|EUR|CHF|USD|GBP|PLN|CZK|SEK/.test(around)) score += 0.75;
       if (a.value === 0) score -= 3;
-      if (inf.copy) score -= 3;
+      if (inf.copy || inf.quoted) score -= 3;
       score += (i / n) * 0.5;
       c.score = score;
-      all.push(c);
+      if (!inf.quoted) all.push(c);
       row.push(c);
     }
     candAt.push(row);
@@ -3487,13 +4483,16 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
   // label line without amount: amount may be on the next line(s)
   for (let i = 0; i < infos.length; i++) {
     const inf = infos[i];
-    if (inf.amounts.length > 0 || !inf.label.strong || inf.header) continue;
+    if (inf.amounts.length > 0 || !inf.label.strong || inf.header || inf.quoted) continue;
+    // an advice title ("Avviso di bonifico") is no label for the first table row
+    if (AVIS_TITLE.test(inf.text) && !STRONG_KEYWORDS.test(inf.text.replace(AVIS_TITLE, " "))) continue;
     // an unreadable amount in the label line itself ("Zahlbetrag 3.454 EUR") – do not borrow from the next line
     // (only an amount-like number counts: thousands groups or a number next to a currency, not "Rechnung 4711" / "Avis 2026-0815")
     if (/\d{1,3}(?:[.']\d{3})+(?![\d,])|\d\s*(?:EUR|€|CHF|USD|GBP)\b|(?:EUR|€|CHF|USD|GBP)\s*\d/i.test(inf.text.replace(/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/g, " "))) continue;
     for (let k = 1; k <= 2 && i + k < infos.length; k++) {
       const nx = infos[i + k];
-      if (nx.header || nx.wrapped !== "") break; // "Wir überweisen Ihnen folgende Posten:" followed by a table
+      if (nx.header || nx.wrapped !== "" || nx.quoted) break; // "Wir überweisen Ihnen folgende Posten:" followed by a table
+      if (nx.amounts.length === 0 && lineCells(nx.text).length >= 6) break; // header row of a table
       if (nx.amounts.length > 0) {
         // a row with several amounts ("Rechnung 4711   3.524,49   70,49") is the value of the label above only when
         // its last amount follows from the others (gross - Skonto = payment, net + VAT = gross)
@@ -3515,14 +4514,14 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
         if (inf.text.length > 45) score -= 1;       // long line = probably a header row, not a label
         if (nx.amounts.length >= 3) score -= 1.5;   // next line is a table row
         if (/:\s*$/.test(inf.text)) score += 0.5;    // "Überweisungsbetrag:"
-        if (inf.copy || nx.copy) score -= 3;
+        if (inf.copy || nx.copy || inf.quoted || nx.quoted) score -= 3;
         if (a.value === 0) score -= 3;               // same zero penalty as on the label line itself
         score += ((i + k) / n) * 0.5;
         const c = newCandidate(a, inf.text + " | " + nx.text, i + k, -1, inf.label);
         c.method = "keyword-next-line";
         c.score = score;
         c.charIdx = a.index;
-        c.copy = inf.copy || nx.copy;
+        c.copy = inf.copy || nx.copy || inf.quoted || nx.quoted;
         c.ownLabel = true;
         all.push(c);
         break;
@@ -3588,6 +4587,29 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
       }
     }
   }
+  // (paid, total) value pairs of netting chains: the total is explained by the payment and is no competitor
+  const chainPairs: number[] = [];
+  // the only data row (or the total row) of a table reconciles itself: gross - deduction columns = payment column;
+  // the gross is then no competitor of the payment
+  for (let i = 0; i < infos.length; i++) {
+    const inf = infos[i];
+    const k = inf.amounts.length;
+    if (k < 3 || !inf.payBonus || inf.quoted) continue;
+    let g = -1, p = -1, dsum = 0, nd = 0, other = false;
+    for (let j = 0; j < k; j++) {
+      const col = inf.cols[j];
+      if (col === "gross") { if (g >= 0) other = true; g = j; }
+      else if (col === "pay") { if (p >= 0) other = true; p = j; }
+      else if (col === "ded" || col === "prev") { dsum += Math.abs(inf.amounts[j].value); nd++; }
+      else if (col !== "") other = true;
+    }
+    if (other || g < 0 || p < 0 || nd === 0) continue;
+    const gv = inf.amounts[g].value, pv = inf.amounts[p].value;
+    if (pv <= 0 || gv <= pv || Math.abs(gv - dsum - pv) >= 0.015) continue;
+    chainPairs.push(pv);
+    chainPairs.push(gv);
+    for (const c of all) if (Math.abs(c.value - gv) < 0.005) c.score -= 2;
+  }
   // "sum of the others": an amount equals the sum of the amounts on keyword-free lines
   const plain: Candidate[] = [];
   let plainTotal = 0;
@@ -3617,7 +4639,8 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
       if (c.method === "largest") c.method = "sum-check";
     }
   }
-  deductionChain(all, infos, candAt);
+  deductionChain(all, infos, candAt, chainPairs);
+  nettingChain(infos, candAt, chainPairs);
   // a total that equals the sum of several payment lines ("Zahlbetrag" per invoice, then "Gesamt") is the grand total
   {
     const payVals: number[] = [];
@@ -3666,6 +4689,51 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
   for (const c of all) maxAbs = Math.max(maxAbs, Math.abs(c.value));
   for (const c of all) if (maxAbs > 0) c.score += (Math.abs(c.value) / maxAbs) * 1.0;
   all.sort((a, b) => (b.score - a.score) || (b.lineIdx - a.lineIdx));
+  // the chosen amount is the gross of exactly one netting chain (box, single row, chain of lines): take its payment
+  // (not when an invoice copy won: that stays a manual check)
+  if (all.length > 0 && !all[0].copy) {
+    let pv = -1, many = false;
+    for (let q = 0; q + 1 < chainPairs.length; q += 2) {
+      if (Math.abs(chainPairs[q + 1] - all[0].value) >= 0.005) continue;
+      if (pv < 0) pv = chainPairs[q];
+      else if (Math.abs(chainPairs[q] - pv) >= 0.005) many = true;
+    }
+    if (pv > 0 && !many) {
+      for (const c of all) if (!c.copy && Math.abs(c.value - pv) < 0.005) { all.splice(all.indexOf(c), 1); all.unshift(c); break; }
+    }
+  }
+  // (E) one explicitly labelled transfer amount ("Überweisungsbetrag", "Auszahlungsbetrag", "Zahlbetrag") beats a computed
+  // total when it comes after the total or is itself a total ("Zahlbetrag gesamt") or ends a netting chain, and the
+  // difference is explained by deductions (chain, one deduction amount, a percentage)
+  let transferValue = -1;
+  let promoted: Candidate | null = null;
+  {
+    let xc: Candidate | null = null, many = false;
+    for (const c of all) {
+      if (!isTransferCand(c, infos)) continue;
+      if (xc === null) xc = c;
+      else if (Math.abs(c.value - xc.value) >= 0.005) { many = true; break; }
+    }
+    if (xc !== null && !many) {
+      transferValue = xc.value;
+      const top = all[0];
+      const lbl = labelOf(xc, infos);
+      let reconciled = xc.confirmed;
+      if (!reconciled && top.value > xc.value) {
+        for (const d of all) {
+          if (!((d.label.ded && !d.label.payment) || d.col === "ded" || d.col === "prev") || d.value === 0 || d.copy) continue;
+          if (Math.abs(top.value - Math.abs(d.value) - xc.value) < 0.015) { reconciled = true; break; }
+        }
+        for (const inf of infos) for (const pc of inf.pcts) if (Math.abs(top.value * (1 - pc / 100) - xc.value) < 0.015) reconciled = true;
+      }
+      if (reconciled && Math.abs(top.value - xc.value) >= 0.005 && !FUTURE_WORD.test(lbl) && !(top.label.payment && top.confirmed) &&
+        (xc.confirmed || xc.lineIdx > top.lineIdx || TOTAL_WORD.test(lbl))) {
+        all.splice(all.indexOf(xc), 1);
+        all.unshift(xc);
+        promoted = xc;
+      }
+    }
+  }
   // (e) the chosen total is not a payment, but a payment-worded line names a different amount:
   // uncertain; suggest that payment when it is the only one and looks like the total minus deductions
   let conflict = "";
@@ -3702,10 +4770,33 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
 
   // ---- confidence: rule quality + distance to the next different amount + absolute score floors
   const text = normLines.join("\n");
-  const avisTitle = AVIS_TITLE.test(text);
+  const avisTitle = doc.kind === "advice";
+  const bestTransfer = transferValue >= 0 && Math.abs(best.value - transferValue) < 0.005;
+  // one amount value in the whole document (outside copies and quoted mails)
+  let singleValue = true;
+  let firstValue = -1;
+  for (const inf of infos) {
+    if (inf.copy || inf.quoted) continue;
+    for (const a of inf.amounts) {
+      if (a.value <= 0) continue;
+      if (firstValue < 0) firstValue = a.value;
+      else if (Math.abs(a.value - firstValue) >= 0.005) singleValue = false;
+    }
+  }
+  if (singleValue && integerCurrencyAmount(doc.ownText)) singleValue = false;
+  let anyPct = false;
+  for (const inf of infos) if (inf.pcts.length > 0) anyPct = true;
   let margin = 99;
   let runnerUp: Candidate | null = null;
-  for (const c of all) if (Math.abs(c.value - best.value) >= 0.005) { margin = best.score - c.score; runnerUp = c; break; }
+  for (const c of all) {
+    if (Math.abs(c.value - best.value) < 0.005) continue;
+    let chained = false;
+    for (let q = 0; q + 1 < chainPairs.length; q += 2) if (Math.abs(chainPairs[q] - best.value) < 0.005 && Math.abs(chainPairs[q + 1] - c.value) < 0.005) chained = true;
+    if (chained) continue;
+    margin = best.score - c.score;
+    runnerUp = c;
+    break;
+  }
   const m = best.method;
   let weakAlone = false;
   if (m === "keyword-weak" && !best.confirmed) {
@@ -3714,9 +4805,14 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
   const strongRule = m === "keyword" || m === "keyword-next-line" || m === "column-sum" || m === "deduction" || (m === "column-header" && best.confirmed);
   let conf = "low";
   let reason = "";
-  if (strongRule && margin >= 1.5 && best.score >= 4) conf = "high";
+  if (promoted !== null) conf = "high";
+  else if (strongRule && margin >= 1.5 && best.score >= 4) conf = "high";
   else if (margin >= 0.75 && best.score >= 2.5 && m !== "largest" && m !== "sum-check" && !weakAlone) conf = "medium";
   else if (m === "sum-check" && avisTitle && best.col === "gross" && infos[best.lineIdx].grossPay && best.pos === infos[best.lineIdx].amounts.length - 1 && margin >= 0.75 && best.score >= 2.5) conf = "medium";
+  // the only explicitly labelled transfer amount, close to a total or subtotal that is not worded as a payment
+  else if (bestTransfer && runnerUp !== null && !runnerUp.label.payment && runnerUp.col !== "pay" && best.score >= 4) conf = best.confirmed ? "high" : "medium";
+  // one amount in an advice or in a payer's letter, no netting words: nothing to confuse it with
+  else if (singleValue && (avisTitle || doc.payer) && !anyPct && !best.label.neg && !NETTING_TEXT.test(doc.ownText)) conf = "medium";
   else if (m === "largest") reason = "no label, amount chosen by size";
   else if (m === "sum-check") reason = "amount only backed by a sum check";
   else if (weakAlone) reason = "only a weak label (Betrag/Zahlung)";
@@ -3725,11 +4821,10 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
 
   const reasons: string[] = [];
   if (reason !== "") reasons.push(reason);
-  // document check: a payment advice talks about paying; delivery notes and direct debits do not count
-  const nonPay = avisTitle ? null : NON_PAYMENT_MARKER.exec(text);
-  if (nonPay) { conf = "low"; reasons.unshift("'" + nonPay[0] + "' - not a payment advice?"); }
-  else if (!PAYMENT_MARKER.test(text) && !PAYMENT_MARKER.test(text.replace(/\s+/g, ""))) { conf = "low"; reasons.unshift("no payment wording - not a payment advice?"); }
-  if (best.copy) { conf = "low"; reasons.push("amount from an attached invoice copy"); }
+  // document check: a payment advice talks about paying; other document types (title, strong phrases) do not count
+  if (doc.kind === "other") { conf = "low"; reasons.unshift(doc.why); }
+  else if (doc.kind !== "advice" && !PAYMENT_MARKER.test(text) && !PAYMENT_MARKER.test(text.replace(/\s+/g, "")) && !(doc.foreignPayer && FOREIGN_PAYMENT_MARKER.test(text))) { conf = "low"; reasons.unshift("no payment wording - not a payment advice?"); }
+  if (best.copy) { conf = "low"; reasons.push(infos[best.lineIdx].quoted ? "amount from the quoted e-mail" : "amount from an attached invoice copy"); }
   else {
     // a total right after a VAT line looks like an invoice – unless it is the only total (self-billing credit note)
     let otherTotal = false;
@@ -3748,7 +4843,7 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
   const dedValues: number[] = [];
   const pctValues: number[] = [];
   for (const d of all) {
-    if (!((d.label.ded && !d.label.payment) || d.col === "ded") || d.value === 0) continue;
+    if (!((d.label.ded && !d.label.payment) || d.col === "ded" || d.col === "prev") || d.value === 0) continue;
     const v = Math.abs(d.value);
     let dup = false;
     for (const x of dedValues) if (Math.abs(x - v) < 0.005) dup = true;
@@ -3762,7 +4857,9 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
     for (const v of dedValues) if (Math.abs(best.value - v - s.value) < 0.015) nearDed = true;
     for (const pc of pctValues) if (Math.abs(best.value * (1 - pc / 100) - s.value) < 0.015) nearDed = true;
   }
-  if (!nearDed && !best.confirmed && best.value > 0) {
+  let valueConfirmed = false;
+  for (const c of all) if (c.confirmed && Math.abs(c.value - best.value) < 0.005) valueConfirmed = true;
+  if (!nearDed && !valueConfirmed && best.value > 0) {
     // best = S + D with S >= 90 % of best and D another amount (deduction without a readable label)
     const vals: number[] = [];
     for (const c of all) if (c.value > 0 && !c.copy && vals.length < 400) vals.push(c.value);
@@ -3786,6 +4883,13 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
     if (looksDed) { conf = "low"; reasons.push("amount looks like a deduction"); }
   }
   if (conflict !== "") { conf = "low"; reasons.push(conflict); }
+  // a line labelled only with a payment noun ("Zahlung 46.609,50") names another amount than the chosen total
+  if (conf !== "low" && !best.label.payment && best.col !== "pay") {
+    for (const c of all) {
+      if (c.copy || c.pos < 0 || !c.ownLabel || c.value <= 0 || Math.abs(c.value - best.value) < 0.005) continue;
+      if (PAY_NOUN.test(labelOf(c, infos).trim())) { conf = "low"; reasons.push("payment line says " + c.amount); break; }
+    }
+  }
   // a bare table total in the payment column only counts credit notes listed below it ("Summe Gutschriften 238,00")
   const payCell = best.col === "pay" && !best.ownLabel;
   if (((!best.label.payment && best.col !== "pay") || payCell) && best.value > 0) {
@@ -3802,6 +4906,56 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
       if (!found) open = true;
     }
     if (open) { conf = "low"; reasons.push("deduction below the total"); }
+  }
+  // credit notes in a block of their own (positive amounts) that the chosen total does not net: the payment is not printed
+  if (!bestTransfer && best.value > 0 && conf !== "low") {
+    const credits: number[] = [];
+    let inSection = false;
+    for (let i = 0; i < infos.length; i++) {
+      const inf = infos[i];
+      if (inf.text.length === 0) { inSection = false; continue; }
+      if (inf.amounts.length === 0) {
+        if (inf.header) { const hc = lineCells(inf.text); inSection = hc.length >= 2 && CREDIT_WORD.test(inf.text.substring(hc[0], hc[1])); }
+        else if (inf.text.length <= 40) inSection = CREDIT_SECTION.test(inf.text);
+        continue;
+      }
+      if (inf.copy || inf.quoted || i === best.lineIdx) continue;
+      if (!inSection && !CREDIT_WORD.test(inf.text.substring(0, inf.amounts[0].index))) continue;
+      const v = inf.amounts[inf.amounts.length - 1].value;
+      if (v > 0 && credits.length < 50) credits.push(v);
+    }
+    if (credits.length > 0) {
+      let csum = 0, cmax = 0;
+      for (const v of credits) { csum += v; cmax = Math.max(cmax, v); }
+      let netted = false;
+      for (const c of all) {
+        const d = c.value - best.value;
+        if (Math.abs(d - cmax) < 0.015 || Math.abs(d - csum) < 0.015 || Math.abs(d - (csum - cmax)) < 0.015) { netted = true; break; }
+      }
+      if (!netted) { conf = "low"; reasons.push("credit note not netted in the total"); }
+    }
+  }
+  // a later total adds further amounts to the chosen payment ("Zahlbetrag 980,00" of the first invoice, then "Summe 3.454,00")
+  if (best.label.payment && conf !== "low") {
+    for (const t of all) {
+      if (t.lineIdx <= best.lineIdx || !t.label.strong || t.label.neg || t.copy || t.value <= best.value + 0.005) continue;
+      let total = best.value, parts = 0, ded = false;
+      for (let li = best.lineIdx + 1; li < t.lineIdx && li <= best.lineIdx + 12; li++) {
+        const k = infos[li].amounts.length;
+        if (infos[li].text.length === 0) { ded = true; break; } // only on the same page
+        if (k === 0) continue;
+        const col = infos[li].cols[k - 1];
+        if (infos[li].labels[k - 1].ded || col === "ded" || col === "prev" || col === "rest" || col === "vat") ded = true;
+        total += infos[li].amounts[k - 1].value;
+        parts++;
+      }
+      if (parts >= 1 && !ded && Math.abs(total - t.value) < 0.015) { conf = "low"; reasons.push("total " + t.amount + " below includes the payment"); break; }
+    }
+  }
+  // a payment sentence with an amount without decimals ("überwiesen haben wir 1.000 EUR"): that value is not read
+  for (let i = 0; i < doc.quoteStart && conf !== "low"; i++) {
+    const t = infos[i].text;
+    if ((PAYMENT_KEYWORDS.test(t) || POST_PAYMENT.test(t)) && integerCurrencyAmount(t)) { conf = "low"; reasons.push("payment amount without decimals"); }
   }
   // (c) a payment label whose amount could not be read
   for (let i = 0; i < infos.length; i++) {
@@ -3851,23 +5005,28 @@ function pickAmount(lines: string[], extraKeywords: string): AmountPick {
 // Orchestration
 // ---------------------------------------------------------------------
 const MAX_TEXT_CHARS = 100000;
+// file name of an advice inside a mail container (preferred over the other PDFs of the mail)
+const ADVICE_FILE_NAME = /zahlungsavis|überweisungsavis|ueberweisungsavis|payment.?advice|remittance|(?:^|[^a-zäöüß])avis(?:[^a-zäöüß]|$)/i;
 
 // Result of the extraction step. encrypted: the PDF cannot be decrypted (cryptError says why);
-// incomplete: reasons why the text may be partial; ocr: an OCR text layer makes up most of the text.
-interface ExtractInfo { lines: string[]; pages: number; warnings: string[]; encrypted: boolean; cryptError: string; incomplete: string[]; ocr: boolean }
+// incomplete: reasons why the text may be partial; ocr: an OCR text layer makes up most of the text;
+// signedChange: a signed PDF was changed after its last signature (what changed), "" otherwise.
+interface ExtractInfo { lines: string[]; pages: number; warnings: string[]; encrypted: boolean; cryptError: string; incomplete: string[]; ocr: boolean; signedChange: string }
 
 function extractPdf(bytes: Uint8Array): ExtractInfo {
   const s = bytesToLatin1(bytes, 0, bytes.length);
   const doc = new PdfDoc(s);
   doc.load();
-  const info: ExtractInfo = { lines: [], pages: 0, warnings: doc.warnings, encrypted: false, cryptError: "", incomplete: doc.incomplete, ocr: false };
+  const info: ExtractInfo = { lines: [], pages: 0, warnings: doc.warnings, encrypted: false, cryptError: "", incomplete: doc.incomplete, ocr: false, signedChange: "" };
   if (doc.cryptStatus !== "none" && doc.cryptStatus !== "decrypted") {
     info.encrypted = true;
     info.cryptError = doc.cryptStatus === "password" ? "PDF is password protected - cannot be read"
       : doc.cryptStatus === "certificate" ? "PDF is encrypted with a certificate - cannot be read"
+      : doc.cryptStatus === "protected" ? "protected PDF - cannot be read"
       : "PDF is encrypted with an unsupported method (" + doc.cryptDetail + ") - cannot be read";
     return info;
   }
+  info.signedChange = doc.changedAfterSigning();
   const pages = doc.pages();
   const interp = new ContentInterpreter(doc);
   const boxes: number[][] = [];
@@ -3898,6 +5057,7 @@ function extractPdf(bytes: Uint8Array): ExtractInfo {
   if (interp.pagesWithImage > 0 && /tesseract|ocrmypdf|abbyy|finereader|readiris|omnipage|paper capture|scansoft|\bocr\b/i.test(doc.producerInfo())) ocrGlyphs += interp.glyphsOnImagePages;
   info.ocr = interp.glyphsTotal > 0 && ocrGlyphs * 2 > interp.glyphsTotal;
   const front: string[] = [];
+  if (info.signedChange !== "") front.push("PDF changed after signing (" + info.signedChange + ")");
   if (doc.cryptStatus === "decrypted") front.push("decrypted (permissions-only encryption)");
   if (info.ocr) front.push("OCR text layer (" + Math.round((100 * ocrGlyphs) / interp.glyphsTotal) + " % of the text)");
   for (const r of doc.incomplete) front.push("incomplete: " + r);
@@ -3909,32 +5069,27 @@ function emptyResult(): AvisResult {
   return { ok: false, amount: "", amountNumber: 0, currency: "", line: "", method: "none", confidence: "low", candidates: [], pages: 0, text: "", textLength: 0, warnings: "", error: "" };
 }
 
-/**
- * Office Script entry point.
- * @param pdfBase64  Base64 content of the PDF (e.g. contentBytes of "Get attachment (V2)")
- * @param extraKeywords  optional, comma separated extra keywords that mark the total line ("Auszahlung, Überweisungssumme"); may be ""
- */
-function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?: string): AvisResult {
+// one analysed PDF: the result and the score of the chosen amount (-1 = none)
+interface PdfOutcome { res: AvisResult; score: number }
+
+function analyzePdf(bytes: Uint8Array, extraKeywords: string): PdfOutcome {
+  // text extraction + amount heuristic for one PDF (bytes start with or contain "%PDF")
   const res = emptyResult();
-  totalDecoded = 0;
-  runDeadline = Date.now() + 90000; // stay well below the 120 s Power Automate limit
+  const out: PdfOutcome = { res: res, score: -1 };
   try {
-    if (!pdfBase64 || pdfBase64.length < 16) { res.error = "no PDF content passed"; return res; }
-    const bytes = base64ToBytes(pdfBase64);
-    if (bytes.length < 8 || bytesToLatin1(bytes, 0, 4) !== "%PDF") {
-      // some mail systems prefix junk before %PDF – look for the header anyway
-      const probe = bytesToLatin1(bytes, 0, Math.min(bytes.length, 2048));
-      if (probe.indexOf("%PDF") < 0) { res.error = "not a PDF (header missing, " + bytes.length + " bytes)"; return res; }
-    }
     const ex = extractPdf(bytes);
     res.pages = ex.pages;
     res.warnings = ex.warnings.slice(0, 20).join(" | ");
-    if (ex.encrypted) { res.error = ex.cryptError; return res; }
+    if (ex.encrypted) { res.error = ex.cryptError; return out; }
     const text = ex.lines.join("\n");
     res.textLength = text.length;
     res.text = text.length > MAX_TEXT_CHARS ? text.substring(0, MAX_TEXT_CHARS) : text;
-    if (text.replace(/\s/g, "").length === 0) { res.error = ex.pages === 0 ? "no pages found" : "no text layer found (scanned PDF?)"; return res; }
-    const pick = pickAmount(ex.lines, extraKeywords || "");
+    if (text.replace(/\s/g, "").length === 0) {
+      // the time budget ran out before any text was read: say so instead of "scanned PDF"
+      res.error = ex.pages === 0 ? "no pages found" : ex.incomplete.indexOf("time budget exhausted") >= 0 ? "PDF read incompletely (time budget exhausted)" : "no text layer found (scanned PDF?)";
+      return out;
+    }
+    const pick = pickAmount(ex.lines, extraKeywords);
     res.currency = pick.currency;
     res.candidates = [];
     for (const c of pick.candidates) res.candidates.push(c.amount + " | " + c.score.toFixed(2) + " | " + c.method + " | " + c.line.substring(0, 120));
@@ -3944,6 +5099,7 @@ function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?:
       res.amountNumber = Math.round(pick.best.value * 100) / 100;
       res.line = pick.best.line;
       res.method = pick.best.method;
+      out.score = pick.best.score;
       // confidence comes from pickAmount (rule quality, margin, score floors, safety nets);
       // a low result always carries a short reason for the manual-check mail
       res.confidence = pick.confidence;
@@ -3961,7 +5117,104 @@ function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?:
       res.error = "uncertain: " + why.join("; ") + (prev !== "" ? "; " + prev : "");
     }
     // ---- end extraction quality ----
+    // ---- signed PDF changed after its last signature: the amount read may not be the signed one ----
+    if (res.ok && ex.signedChange !== "") {
+      const prev = res.error.indexOf("uncertain: ") === 0 ? res.error.substring(11) : res.error;
+      res.confidence = "low";
+      res.error = "uncertain: PDF changed after signing" + (prev !== "" ? "; " + prev : "");
+    }
+    return out;
+  } catch (e) {
+    res.error = "exception: " + String(e);
+    return out;
+  }
+}
+
+function outcomeRank(o: PdfOutcome): number {
+  // ok first, then confidence, then score (used to pick the best PDF of a mail)
+  const conf = o.res.confidence === "high" ? 2 : o.res.confidence === "medium" ? 1 : 0;
+  return (o.res.ok ? 1e9 : 0) + conf * 1e7 + Math.max(-1, Math.min(o.score, 999999));
+}
+
+function mailResult(mail: MailScan, inputLength: number, extraKeywords: string): AvisResult {
+  // result for a mail container (smime.p7m, .eml): pick the PDF and analyse it
+  if (mail.pdfs.length === 0) {
+    const res = emptyResult();
+    res.error = mail.encrypted ? "S/MIME encrypted mail - cannot be read"
+      : mail.rpmsg ? "protected mail (Microsoft Purview) - cannot be read"
+      : mail.signed ? "signed mail contains no PDF"
+      : "not a PDF (header missing, " + inputLength + " bytes)";
     return res;
+  }
+  // the same file attached twice counts once
+  const pdfs: MailPdf[] = [];
+  for (const p of mail.pdfs) {
+    let dup = false;
+    for (const q of pdfs) if (q.data.length === p.data.length && bytesEqual(q.data, p.data, p.data.length)) dup = true;
+    if (!dup) pdfs.push({ name: p.name !== "" ? p.name : "(unnamed)", data: p.data });
+  }
+  // a file named like an advice wins; otherwise every PDF is analysed and the best result is kept
+  let cands: MailPdf[] = [];
+  // ("Zahlungsavis_4711.pdf", "Avis-4711.pdf", "Remittance.pdf"; not "Lieferavis", "Versandavis", "Avisierung", "Davis")
+  for (const p of pdfs) if (ADVICE_FILE_NAME.test(p.name)) cands.push(p);
+  if (cands.length === 0) cands = pdfs;
+  const MAX_PDFS = 6;
+  const outcomes: PdfOutcome[] = [];
+  let best = -1;
+  for (let i = 0; i < cands.length && i < MAX_PDFS; i++) {
+    if (i > 0 && Date.now() > runDeadline) break;
+    totalDecoded = 0;
+    const o = analyzePdf(cands[i].data, extraKeywords);
+    outcomes.push(o);
+    if (best < 0 || outcomeRank(o) > outcomeRank(outcomes[best])) best = i;
+  }
+  const res = outcomes[best].res;
+  const notes: string[] = [(mail.signed ? "from signed mail: " : "from mail: ") + cands[best].name];
+  if (outcomes.length > 1) {
+    let names = "";
+    for (let i = 0; i < outcomes.length; i++) names += (i > 0 ? ", " : "") + cands[i].name;
+    notes.push(outcomes.length + " PDFs checked (" + names + ")");
+  }
+  if (cands.length > outcomes.length) notes.push("only " + outcomes.length + " of " + cands.length + " PDFs checked");
+  if (mail.extraPdfs > 0) notes.push("only the first " + mail.pdfs.length + " of " + (mail.pdfs.length + mail.extraPdfs) + " PDFs read");
+  // two PDFs with different trusted amounts: which one is the payment is not clear
+  if (res.ok && res.confidence !== "low") {
+    for (let i = 0; i < outcomes.length; i++) {
+      const o = outcomes[i].res;
+      if (i === best || !o.ok || o.confidence === "low") continue;
+      if (o.amountNumber === res.amountNumber && o.currency === res.currency) continue;
+      const prev = res.error.indexOf("uncertain: ") === 0 ? res.error.substring(11) : res.error;
+      res.confidence = "low";
+      res.error = "uncertain: several PDFs in the mail with different amounts (" + cands[i].name + ": " + o.amount + ")" + (prev !== "" ? "; " + prev : "");
+      break;
+    }
+  }
+  res.warnings = notes.join(" | ") + (res.warnings !== "" ? " | " + res.warnings : "");
+  return res;
+}
+
+function main(workbook: ExcelScript.Workbook, pdfBase64: string, extraKeywords?: string): AvisResult {
+  // Office Script entry point.
+  // @param pdfBase64  Base64 content of the PDF (e.g. contentBytes of "Get attachment (V2)"); also accepted:
+  //                   the content of an S/MIME "smime.p7m" attachment (signed mail) or of an .eml file -
+  //                   the PDF inside is used (the signature is not verified)
+  // @param extraKeywords  optional, comma separated extra keywords that mark the total line ("Auszahlung, Überweisungssumme"); may be ""
+  const res = emptyResult();
+  totalDecoded = 0;
+  runDeadline = Date.now() + 90000; // stay well below the 120 s Power Automate limit
+  try {
+    if (!pdfBase64 || pdfBase64.length < 16) { res.error = "no PDF content passed"; return res; }
+    const bytes = base64ToBytes(pdfBase64);
+    if (bytes.length < 8 || bytesToLatin1(bytes, 0, 4) !== "%PDF") {
+      // not a PDF: a mail container (smime.p7m: clear-signed MIME text or CMS SignedData; encrypted S/MIME; .rpmsg)?
+      const mail = unwrapMail(bytes);
+      if (mail.container) return mailResult(mail, bytes.length, extraKeywords || "");
+      totalDecoded = 0;
+      // some mail systems prefix junk before %PDF – look for the header anyway
+      const probe = bytesToLatin1(bytes, 0, Math.min(bytes.length, 2048));
+      if (probe.indexOf("%PDF") < 0) { res.error = "not a PDF (header missing, " + bytes.length + " bytes)"; return res; }
+    }
+    return analyzePdf(bytes, extraKeywords || "").res;
   } catch (e) {
     res.error = "exception: " + String(e);
     return res;
