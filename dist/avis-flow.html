@@ -119,9 +119,9 @@ pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); p
               <p class="eyebrow">Steuerung <span class="tag keep">bestehend, neu gefasst</span></p>
               <h2>Bedingung 2 – Avis-PDF oder signierte Avis-Mail</h2>
               <dl class="fields">
-                <dt>Zeile 1: ist gleich <code>true</code></dt><dd><code>or(and(contains(toLower(items('Apply_to_each')?['name']), 'avis'), endsWith(toLower(items('Apply_to_each')?['name']), '.pdf')), and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis')))</code></dd>
+                <dt>Zeile 1: ist gleich <code>true</code></dt><dd><code>and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))</code></dd>
                 <dt>Zeile 2: ist gleich <code>false</code></dt><dd><code>items('Apply_to_each')?['isInline']</code></dd>
-                <dt>Bedeutung</dt><dd>Name enthält „avis" und endet auf „.pdf" (Groß/klein egal), oder die Anlage ist <code>smime.p7m</code> (signierte Mail) bzw. <code>message.rpmsg</code> (Purview-geschützt) und Betreff oder Dateiname enthalten „avis". Kein eingebettetes Bild.</dd>
+                <dt>Bedeutung</dt><dd>Anlage endet auf „.pdf", <code>.p7m</code> (signierte Mail) oder <code>.rpmsg</code> (Purview-geschützt), Groß/klein egal, und Dateiname oder Betreff enthalten „avis". Kein eingebettetes Bild.</dd>
               </dl>
             </div>
             <div class="arrow"></div>
@@ -245,7 +245,7 @@ pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); p
               </div>
               <div class="scope false">
                 <p class="label">Falsch</p>
-                <p class="empty">0 Aktionen – Anlage ist kein Avis-PDF (Signaturbild, andere Datei, <code>smime.p7m</code> ohne „avis" im Betreff, PDF ohne „avis" im Namen).</p>
+                <p class="empty">0 Aktionen – Anlage ist kein Avis-PDF (Signaturbild, andere Datei, PDF oder <code>smime.p7m</code> ohne „avis" in Dateiname und Betreff).</p>
               </div>
             </div>
           </div>

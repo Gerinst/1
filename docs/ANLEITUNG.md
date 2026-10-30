@@ -37,7 +37,7 @@ In jedem Feld, das du neu befüllst, zuerst den alten Inhalt entfernen: fx- oder
 
 1. **Neues Skript einfügen:** Excel im Browser, Reiter **Automatisieren**, **Alle Skripts** (bzw. **Skripts anzeigen**), **AvisPdfAmount** anklicken, **Bearbeiten**. Im Editor Strg+A, Entf, dann den Inhalt der neuen `AvisPdfAmount.ts` einfügen (wie Schritt 1 A, Punkt 5) und **Skript speichern**. Die Felder bleiben gleich.
 2. **Run_script, Feld pdfBase64** umstellen: den Blitz-Baustein „Inhaltsbytes" über sein **×** entfernen, dann **fx** und `base64(body('Get_attachment')?['contentBytes'])` eingeben, **Hinzufügen** (Schritt 4, Punkt 4). Ohne diese Änderung übergibt Power Automate die PDF oft als Text statt als Base64. Die meisten PDFs sind dann nicht mehr lesbar, und es kommt die gelbe Mail mit „not a PDF (header missing, …)" oder „PDF arrived as text instead of Base64".
-3. **Bedingung 2** neu fassen, damit signierte Avis-Mails durchkommen: Schritt 3. Hattest du die optionale Betreff-Variante (rechts fx `true`): vorher den Hinweis „Früher mit Betreff-Variante" am Ende von Schritt 3 lesen.
+3. **Bedingung 2**, Zeile 1: die Formel ersetzen (Schritt 3). Mit der neuen Formel kommt eine PDF auch dann durch, wenn „avis" nur im Betreff steht und die Datei anders heißt (z. B. „Zahlung_4711.pdf"). Signierte Avis-Mails (`smime.p7m`) kommen ebenfalls durch. Steht rechts schon fx `true`, bleibt das so.
 4. **Run_script** bekommt eine Wiederholungsrichtlinie: Schritt 4, Punkte 8 und 9.
 5. **Betrag_erkannt** (und Skriptergebnis, falls vorhanden) läuft auch, wenn Run_script fehlschlägt: Schritt 6, Punkte 7 bis 10.
 6. **Mail_mit_Betrag:** neuer Betreff und neuer Text (Schritt 7, Punkte 5 und 6).
@@ -151,17 +151,20 @@ Warum die 1: Das Skript darf nur 3-mal in 10 Sekunden laufen. Kommen mehrere Avi
 
 ## Schritt 3: Innere „Bedingung 2" neu fassen
 
-Bedingung 2 entscheidet, welche Anlage an das Skript geht. Sie lässt zwei Fälle durch:
+Bedingung 2 entscheidet, welche Anlage an das Skript geht. Eine Anlage geht durch, wenn beides zutrifft:
 
-- **Normales Avis:** Der Dateiname enthält „avis" und endet auf „.pdf". Groß-/Kleinschreibung ist egal („AVIS_4711.PDF" zählt auch).
-- **Signierte oder geschützte Avis-Mail:** Bei einer signierten Mail (S/MIME) sieht Power Automate statt der PDF nur eine einzige Anlage `smime.p7m`. Bei einer mit Microsoft Purview geschützten Mail heißt sie `message.rpmsg`. Diese Anlagen gehen an das Skript, wenn der **Betreff** oder der Dateiname „avis" enthält (auch eine einzeln signierte PDF wie `Zahlungsavis.pdf.p7m`). Das Skript packt signierte Mails selbst aus und liest die PDF darin. Ob die Signatur gültig ist, prüft es nicht; das zeigt dir Outlook beim Öffnen der Original-Mail. Verschlüsselte oder geschützte Mails kann es nicht öffnen: Dann kommt eine gelbe Prüf-Mail mit dem Grund.
+- **Dateityp:** Sie endet auf „.pdf", „.p7m" oder „.rpmsg". Groß-/Kleinschreibung ist egal („AVIS_4711.PDF" zählt auch).
+- **„avis" im Dateinamen oder im Betreff:** „Zahlungsavis_4711.pdf" geht durch, „Zahlung_4711.pdf" auch, wenn der Betreff z. B. „Avis 10/2026" heißt.
 
-Beide Fälle stehen zusammen in der Formel von Zeile 1. Zeile 2 schließt eingebettete Bilder aus (z. B. Logos in der Signatur).
+**Signierte oder geschützte Avis-Mail:** Bei einer signierten Mail (S/MIME) sieht Power Automate statt der PDF nur eine einzige Anlage `smime.p7m`. Bei einer mit Microsoft Purview geschützten Mail heißt sie `message.rpmsg`. Für sie gilt dieselbe Regel (auch für eine einzeln signierte PDF wie `Zahlungsavis.pdf.p7m`). Das Skript packt signierte Mails selbst aus und liest die PDF darin. Ob die Signatur gültig ist, prüft es nicht; das zeigt dir Outlook beim Öffnen der Original-Mail. Verschlüsselte oder geschützte Mails kann es nicht öffnen: Dann kommt eine gelbe Prüf-Mail mit dem Grund.
 
-1. Auf **Bedingung 2** klicken (die innere, mit name enthält avis).
-2. **Zeile 1:** Im linken Feld den vorhandenen Baustein (**name** oder den fx-Baustein `toLower(…)`) über sein **×** entfernen. Dann in das leere Feld klicken, auf das **fx**-Symbol, diese Formel einfügen, auf **Hinzufügen** klicken:
-    `or(and(contains(toLower(items('Apply_to_each')?['name']), 'avis'), endsWith(toLower(items('Apply_to_each')?['name']), '.pdf')), and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis')))`
-3. Operator in der Mitte auf **ist gleich** stellen. Im rechten Feld den Text `avis` löschen, dann **fx**, `true` einfügen, **Hinzufügen**. (Über fx, nicht als Text, sonst vergleicht Power Automate mit dem Wort „true". Steht rechts schon ein fx-Baustein `true`, weil du früher die optionale Betreff-Variante genommen hast: so lassen, aber den Hinweis „Früher mit Betreff-Variante" am Ende dieses Schritts lesen.)
+Beides steht in der Formel von Zeile 1. Zeile 2 schließt eingebettete Bilder aus (z. B. Logos in der Signatur).
+
+1. Auf **Bedingung 2** klicken (die innere, mit name enthält avis bzw. der fx-Formel in Zeile 1).
+2. **Zeile 1:** Im linken Feld den vorhandenen Baustein (**name**, `toLower(…)`, `or(…)` oder `and(…)`) über sein **×** entfernen. Dann in das leere Feld klicken, auf das **fx**-Symbol, diese Formel einfügen, auf **Hinzufügen** klicken:
+    `and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))`
+    Die Formel steht auch in [formeln/Bedingung_2_Zeile_1.txt](../formeln/Bedingung_2_Zeile_1.txt) zum Kopieren.
+3. Operator in der Mitte auf **ist gleich** stellen. Im rechten Feld den Text `avis` löschen, dann **fx**, `true` einfügen, **Hinzufügen**. (Über fx, nicht als Text, sonst vergleicht Power Automate mit dem Wort „true". Steht rechts schon ein fx-Baustein `true`: so lassen.)
 4. **Zeile mit „endet mit .PDF / .pdf":** Diese Prüfung steckt jetzt in der Formel von Zeile 1. Rechts in der Zeile auf **⋯** klicken, **Löschen**.
 5. **Zeile mit isInline:** Hast du sie schon (links fx `items('Apply_to_each')?['isInline']`, ist gleich, rechts fx `false`), bleibt sie, wie sie ist. Sonst die leere Zeile nehmen oder **+ Zeile hinzufügen**: Links in „Wert auswählen" klicken, fx, Formel einfügen, Hinzufügen:
     `items('Apply_to_each')?['isInline']`
@@ -175,16 +178,14 @@ So sieht das Ergebnis aus:
 
 | Links | Operator | Rechts |
 | --- | --- | --- |
-| fx `or(and(contains(toLower(items('Apply_to_each')?['name']), 'avis'), …` (die lange Formel aus Punkt 2) | ist gleich | fx `true` |
+| fx `and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), …` (die lange Formel aus Punkt 2) | ist gleich | fx `true` |
 | fx `items('Apply_to_each')?['isInline']` | ist gleich | fx `false` |
 
 Der Falsch-Zweig von Bedingung 2 bleibt leer (0 Aktionen): Signaturbilder und andere Anhänge werden einfach übersprungen.
 
-Avise, deren Dateiname kein „avis" enthält (z. B. „Zahlung_4711.pdf"), lässt diese Bedingung bewusst noch nicht durch. Sie bekommen **keine** Mail und keine Kategorie. Ob das nötig ist, siehst du nach ein paar Wochen am Tagescheck (Schritt 11): Er listet Mails mit „avis" im Betreff, die der Flow nicht bearbeitet hat.
+**Mehrere PDFs in einer Avis-Mail:** Steht „avis" im Betreff, geht jede PDF der Mail an das Skript, auch z. B. mitgeschickte Rechnungskopien. Für jede kommt eine eigene [Avis-Bot]-Mail; Rechnungen und andere Nicht-Avise meist als gelbe „Betrag nicht erkannt". Wird dir das zu viel, nimm in Zeile 1 die strengere Formel aus Anhang A (bei PDFs zählt nur der Dateiname). Dann kommen Avise wie „Zahlung_4711.pdf" aber ohne Meldung nicht an; richte in dem Fall den Tagescheck (Schritt 11) ein.
 
-**Früher mit Betreff-Variante:** Hattest du in Zeile 1 die optionale Formel mit dem Betreff, hat dein Flow solche Avise bisher gelesen. Mit der neuen Formel kommen sie ohne Meldung nicht mehr an. Kommen sie bei dir vor, nimm in Zeile 1 stattdessen diese Formel (jede PDF, .p7m- oder .rpmsg-Anlage, wenn Dateiname oder Betreff „avis" enthält; wie früher kommt dann bei mehreren PDFs in einer Mail für jede PDF eine eigene Mail):
-    `and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))`
-    Sonst den Tagescheck (Schritt 11) auf jeden Fall einrichten.
+Steht „avis" weder im Dateinamen noch im Betreff, geht die Anlage nicht an das Skript. Es kommt keine Mail, und auch der Tagescheck sieht sie nicht.
 
 ## Schritt 4: „Skript ausführen" einfügen
 
@@ -509,7 +510,7 @@ Steht eine Mail in der Liste, im Avis-Flow unter **Ausführungsverlauf** den Lau
 | Im Verlauf | Bedeutung | Was tun |
 | --- | --- | --- |
 | Kein Lauf zu dieser Zeit | Der Avis-Flow war aus | Flow einschalten, Betrag von Hand |
-| Lauf endet an Bedingung 2 (Falsch) | „avis" stand nur im Betreff, die Anlage hieß anders (z. B. „Zahlung_4711.pdf") oder war keine PDF (z. B. eine Excel-Datei) | Betrag von Hand. Kommt das öfter mit demselben Absender, Schritt 3 erweitern lassen |
+| Lauf endet an Bedingung 2 (Falsch) | Die Anlage war keine PDF (z. B. eine Excel-Datei), oder Zeile 1 hat noch eine ältere Formel, die nur den Dateinamen prüft (Avis „Zahlung_4711.pdf" mit „avis" nur im Betreff) | Betrag von Hand. Ältere Formel: Zeile 1 durch die Formel aus Schritt 3 ersetzen |
 | Rotes X bei Kategorie_rot oder Kategorie_gelb | Die Kategorie konnte nicht gesetzt werden (z. B. 403 oder eine kurze Störung; eine verschobene Mail steht nicht in dieser Liste) | Die [Avis-Bot]-Mail ist da, nur die Farbe fehlt. Kategorie von Hand setzen |
 | Rotes X bei einer anderen Aktion | Der Lauf ist abgebrochen | Fehlertabelle in Schritt 10 |
 
@@ -532,8 +533,8 @@ Jede Formel wird über das **fx**-Symbol eingefügt, dann **Hinzufügen**. Vorau
 
 | Wo | Formel |
 | --- | --- |
-| Bedingung 2 (innere), Zeile 1, links (Operator ist gleich, rechts fx `true`) | `or(and(contains(toLower(items('Apply_to_each')?['name']), 'avis'), endsWith(toLower(items('Apply_to_each')?['name']), '.pdf')), and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis')))` |
-| Alternative für Bedingung 2, Zeile 1, mit Betreff (Schritt 3, „Früher mit Betreff-Variante") | `and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))` |
+| Bedingung 2 (innere), Zeile 1, links (Operator ist gleich, rechts fx `true`) | `and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))` |
+| Strengere Alternative für Bedingung 2, Zeile 1: PDFs nur mit „avis" im Dateinamen, `smime.p7m`/`message.rpmsg` weiter auch über den Betreff (Schritt 3, „Mehrere PDFs in einer Avis-Mail") | `or(and(contains(toLower(items('Apply_to_each')?['name']), 'avis'), endsWith(toLower(items('Apply_to_each')?['name']), '.pdf')), and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis')))` |
 | Bedingung 2 (innere), Zeile 2, links | `items('Apply_to_each')?['isInline']` |
 | Bedingung 2 (innere), Zeile 2, rechts | `false` |
 | Run_script, pdfBase64 | `base64(body('Get_attachment')?['contentBytes'])` |

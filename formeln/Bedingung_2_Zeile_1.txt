@@ -1,0 +1,1 @@
+and(or(endsWith(toLower(items('Apply_to_each')?['name']), '.pdf'), endsWith(toLower(items('Apply_to_each')?['name']), '.p7m'), endsWith(toLower(items('Apply_to_each')?['name']), '.rpmsg')), contains(toLower(concat(items('Apply_to_each')?['name'], ' ', coalesce(triggerOutputs()?['body/subject'], ''))), 'avis'))
