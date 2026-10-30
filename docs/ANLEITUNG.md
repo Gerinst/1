@@ -1,10 +1,31 @@
 # Avis-Flow Schritt für Schritt
 
-Stand: 29.10.2026
+Stand: 30.10.2026
 
 ## Überblick
 
-Am Ende bekommst du für jedes Zahlungsavis eine Mail mit dem Betrag im Betreff (z. B. „WG: Zahlungsavis vom 01.10.2026 - 3.454,00 EUR"), und die Original-Mail hat in Outlook eine rote Kategorie. Konnte der Betrag nicht erkannt werden, kommt stattdessen eine Mail „Betrag nicht erkannt" mit gelber Kategorie.
+Am Ende bekommst du für jedes Zahlungsavis eine Mail mit dem Betrag im Betreff (z. B. „[Avis-Bot] Zahlungsavis vom 01.10.2026 - 3.454,00 EUR"), und die Original-Mail hat in Outlook eine rote Kategorie. Konnte der Betrag nicht erkannt werden, kommt stattdessen eine Mail „Betrag nicht erkannt" mit gelber Kategorie.
+
+## Wichtig: Schleifenschutz
+
+Der Flow schickt seine Ergebnis-Mails an deine eigene Adresse, mit dem Avis-PDF im Anhang. Diese Mails landen im selben Posteingang, den der Flow überwacht. Ohne Schutz startet jede Ergebnis-Mail den Flow erneut, der schickt wieder eine Mail und so weiter: eine Endlosschleife („WG: WG: WG: …"), bis das Tageslimit von Microsoft aufgebraucht ist und echte Avise still liegen bleiben. Deshalb beginnen alle Mails des Flows mit `[Avis-Bot]`, und die äußere Bedingung lässt Mails mit `[Avis-Bot]` im Betreff nicht durch (Schritte 1c, 7 und 9).
+
+**Schleifenschutz in einem bestehenden Flow nachrüsten (ca. 10 Minuten)**
+
+Hast du den Flow nach einer früheren Fassung dieser Anleitung gebaut (Betreff der Ergebnis-Mails beginnt mit `WG: `), dann mach diese Schritte, **bevor** das nächste Avis durchläuft:
+
+1. Falls sich schon Mails stapeln: make.powerautomate.com, **Meine Flows**, beim Flow auf **⋮** und **Ausschalten**. Danach die Schritte 2 bis 6, am Ende wieder einschalten.
+2. Flow öffnen, oben **Bearbeiten**.
+3. Die äußere **Bedingung** (direkt unter dem Trigger) anklicken. Die Zeile **Von | enthält nicht | noreply** umbauen: Links den Baustein „Von" mit dem **x** löschen, **Blitz**, unter dem Trigger **Betreff** wählen. Operator bleibt **enthält nicht**. Rechts `noreply` löschen und `[Avis-Bot]` eintippen, mit den eckigen Klammern. Hat deine Bedingung keine noreply-Zeile: **+ Zeile hinzufügen** und die Zeile so neu anlegen.
+4. Aktion **Mail_mit_Betrag** (Wahr-Zweig von Betrag_erkannt) anklicken. Im Feld **Betreff** den vorhandenen fx-Baustein mit dem **x** löschen, dann **fx**, diese Formel einfügen, **Hinzufügen**:
+    `concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])`
+5. Aktion **Mail_nicht_erkannt** (Falsch-Zweig von Betrag_erkannt) genauso, mit dieser Formel:
+    `concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')`
+6. **Speichern**. Falls du in Punkt 1 ausgeschaltet hast: zurück zu **Meine Flows**, **⋮**, **Einschalten**.
+7. Prüfen wie in Schritt 10: Dir eine Test-Mail mit Avis-PDF schicken. Richtig ist: genau **eine** Mail „[Avis-Bot] …". Im Ausführungsverlauf stehen zwei Läufe, der echte und ein zweiter, den die [Avis-Bot]-Mail ausgelöst hat. Der zweite bleibt an der äußeren Bedingung stehen (Falsch-Zweig, keine Aktion). Das ist so gewollt.
+8. Aufräumen: In Outlook nach `WG: WG:` suchen und die Mails aus der Schleife löschen.
+
+Warum die noreply-Zeile wegfällt: Viele Buchhaltungssysteme (SAP und andere) verschicken echte Avise von noreply-Adressen. Mit der alten Zeile wären genau diese Avise still verloren gegangen.
 
 Die Anleitung ist für den neuen Power-Automate-Designer auf Deutsch geschrieben: Aktion anklicken, dann öffnet sich links das Fenster mit den Reitern Parameter / Einstellungen / Codeansicht / Info. Eine Aktion hinzufügen heißt immer: auf das Plus unter der vorherigen Aktion klicken, im Fenster „Aktion hinzufügen" oben in die Suche tippen, Treffer anklicken.
 
@@ -70,13 +91,13 @@ Zur Benennung: Die innere Bedingung heißt im Ausgangsflow **„Bedingung 2"** (
 
 ## Schritt 1c: Äußere Bedingung korrigieren
 
-Ziel: Automatische Antworten, Zustellfehler und Abwesenheitsnotizen sollen nicht durch den Flow laufen. Alles andere soll durch.
+Ziel: Automatische Antworten, Zustellfehler, Abwesenheitsnotizen und die eigenen Mails des Flows (`[Avis-Bot]`) sollen nicht durch den Flow laufen. Alles andere soll durch.
 
 1. Auf die äußere **Bedingung** (direkt unter dem Trigger) klicken.
 2. In der ersten Zeile im rechten Feld den Text „enthält nicht" komplett löschen und stattdessen eintippen: `Automatische Antwort`
 3. Linkes Feld bleibt **Betreff**, Operator in der Mitte bleibt **enthält nicht**.
 4. Zweite Zeile ausfüllen: Links in „Wert auswählen" klicken, **Blitz**, unter dem Trigger **Betreff** wählen. Operator: **enthält nicht**. Rechts eintippen: `Unzustellbar`
-5. Auf **+ Zeile hinzufügen**. Dritte Zeile: Links Blitz, diesmal **Von** aus dem Trigger. Operator: **enthält nicht**. Rechts: `noreply`
+5. Auf **+ Zeile hinzufügen**. Dritte Zeile, der Schleifenschutz: Links Blitz, wieder **Betreff** aus dem Trigger. Operator: **enthält nicht**. Rechts: `[Avis-Bot]` (mit den eckigen Klammern). Ohne diese Zeile starten die Mails, die der Flow an dich schickt, den Flow immer wieder (siehe „Wichtig: Schleifenschutz" oben).
 6. Der Kasten oben links bleibt auf **Und**.
 7. Keine Zeile darf leer bleiben. Überschüssige Zeilen: rechts auf **⋯** klicken, **Löschen**.
 8. **Speichern**.
@@ -85,7 +106,7 @@ Ziel: Automatische Antworten, Zustellfehler und Abwesenheitsnotizen sollen nicht
 | --- | --- | --- |
 | Blitz: Betreff | enthält nicht | Automatische Antwort |
 | Blitz: Betreff | enthält nicht | Unzustellbar |
-| Blitz: Von | enthält nicht | noreply |
+| Blitz: Betreff | enthält nicht | [Avis-Bot] |
 
 Der Falsch-Zweig bleibt leer (0 Aktionen). Wenn später weitere Automatik-Mails auffallen (z. B. „Out of Office"), einfach eine weitere Zeile nach demselben Muster anhängen.
 
@@ -195,8 +216,8 @@ Die Original-Mail kann Power Automate nicht umbenennen (Microsoft erlaubt das nu
 2. `E-Mail senden` suchen, unter **Office 365 Outlook** den Eintrag **E-Mail senden (V2)** anklicken.
 3. Aktion umbenennen in `Mail_mit_Betrag`.
 4. **An:** deine E-Mail-Adresse eintippen.
-5. **Betreff:** In das Feld klicken, **fx**, Formel einfügen, Hinzufügen:
-    `concat('WG: ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])`
+5. **Betreff:** In das Feld klicken, **fx**, Formel einfügen, Hinzufügen. Das `[Avis-Bot]` am Anfang ist der Schleifenschutz, nicht weglassen:
+    `concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])`
 6. **Text:** Rechts über dem Textfeld auf das Symbol **</>** (Codeansicht) klicken, damit du HTML eingeben kannst. Dann diesen Block komplett einfügen. Die Teile mit `@{...}` wandelt Power Automate beim Einfügen automatisch in bunte Bausteine um:
 
 ```
@@ -214,7 +235,7 @@ Die Original-Mail kann Power Automate nicht umbenennen (Microsoft erlaubt das nu
     - **Anlagen Inhalt:** fx, `body('Get_attachment')?['contentBytes']`, Hinzufügen
 9. **Speichern**.
 
-Ergebnis: Eine Mail an dich mit Betreff „WG: Zahlungsavis vom 01.10.2026 - 3.454,00 EUR", oben Absender, Empfangszeit, Originalbetreff und Betrag, darunter der Originaltext, die PDF hängt an.
+Ergebnis: Eine Mail an dich mit Betreff „[Avis-Bot] Zahlungsavis vom 01.10.2026 - 3.454,00 EUR", oben Absender, Empfangszeit, Originalbetreff und Betrag, darunter der Originaltext, die PDF hängt an.
 
 ## Schritt 8: Wahr-Zweig, rote Kategorie auf die Original-Mail
 
@@ -249,8 +270,8 @@ Hier landet alles, was das Skript nicht sicher lesen konnte (kein Betrag gefunde
 1. Im Zweig **Falsch** von Betrag_erkannt auf das **Plus** klicken, **Aktion hinzufügen**, `E-Mail senden` suchen, **E-Mail senden (V2)** unter Office 365 Outlook wählen.
 2. Umbenennen in `Mail_nicht_erkannt`.
 3. **An:** deine Adresse.
-4. **Betreff:** fx, Formel einfügen, Hinzufügen:
-    `concat('WG: ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')`
+4. **Betreff:** fx, Formel einfügen, Hinzufügen (auch hier `[Avis-Bot]` am Anfang nicht weglassen):
+    `concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')`
 5. **Text:** Codeansicht **</>** anklicken, einfügen:
 
 ```
@@ -283,12 +304,14 @@ Was du mit der Prüf-Mail machst: Die Liste „Gefundene Beträge" zeigt dir, we
 2. Dir selbst eine Mail mit einem echten Avis-PDF im Anhang schicken (Dateiname muss „avis" enthalten).
 3. Nach 1 bis 2 Minuten zeigt Power Automate den Lauf. Grüne Haken = Aktion gelaufen, rotes X = Fehler, grauer Pfeil = übersprungen (z. B. der nicht genommene Zweig, das ist normal).
 4. Auf **Skriptergebnis** (oder Run_script) klicken: Unter **Ausgaben** siehst du `amount`, `method`, `confidence` und den gelesenen Text.
-5. In Outlook prüfen: Neue Mail mit Betrag im Betreff da? Original-Mail rot markiert?
+5. In Outlook prüfen: Genau eine neue Mail „[Avis-Bot] …" mit Betrag im Betreff da? Original-Mail rot markiert?
+6. Schleifenschutz prüfen: Unter **Ausführungsverlauf** steht ein zweiter Lauf, ausgelöst durch die [Avis-Bot]-Mail. Er muss an der äußeren Bedingung stehen bleiben (Falsch-Zweig). Läuft er weiter bis Run_script: Flow sofort ausschalten und Schritt 1c prüfen.
 
 **Typische Fehler und was dahintersteckt**
 
 | Was du siehst | Ursache | Lösung |
 | --- | --- | --- |
+| Mails „WG: WG: WG: …" oder „[Avis-Bot] [Avis-Bot] …" stapeln sich | Schleifenschutz fehlt: die eigenen Mails des Flows starten ihn erneut | Flow sofort ausschalten (Meine Flows, ⋮, Ausschalten), dann „Schleifenschutz nachrüsten" ganz oben |
 | Run_script: „BadGateway" oder „We couldn't find the script" | Skript nicht gespeichert oder falscher Name | In Excel prüfen, dass das Skript **AvisPdfAmount** heißt und gespeichert ist, dann in Run_script neu auswählen |
 | Run_script: Felder pdfBase64 / extraKeywords fehlen | Skript wurde vor dem Speichern ausgewählt | Skript in Run_script einmal abwählen und neu wählen |
 | Run_script: „The request content size exceeds the limit" | PDF größer als ca. 20 MB | Kommt bei Avisen praktisch nie vor; sonst Mail in den Falsch-Zweig lassen |
@@ -320,8 +343,9 @@ Jede Formel wird über das **fx**-Symbol eingefügt, dann **Hinzufügen**. Vorau
 | Skriptergebnis, Eingaben | `outputs('Run_script')?['body/result']` |
 | Betrag_erkannt, links | `and(equals(outputs('Run_script')?['body/result/ok'], true), not(equals(outputs('Run_script')?['body/result/confidence'], 'low')))` |
 | Betrag_erkannt, rechts | `true` |
-| Mail_mit_Betrag, Betreff | `concat('WG: ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])` |
-| Mail_nicht_erkannt, Betreff | `concat('WG: ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')` |
+| Äußere Bedingung, Zeile 3 (Schleifenschutz) | links Blitz **Betreff**, Operator **enthält nicht**, rechts `[Avis-Bot]` |
+| Mail_mit_Betrag, Betreff | `concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])` |
+| Mail_nicht_erkannt, Betreff | `concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')` |
 | Beide Mails, Anlagen Name | `items('Apply_to_each')?['name']` |
 | Beide Mails, Anlagen Inhalt | `body('Get_attachment')?['contentBytes']` |
 | Beide Mails, Absender | `triggerOutputs()?['body/from']` |

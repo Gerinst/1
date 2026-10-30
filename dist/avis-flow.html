@@ -77,8 +77,8 @@ pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); p
   <div class="arrow"></div>
   <div class="step cond">
     <p class="eyebrow">Steuerung <span class="tag keep">bestehend</span></p>
-    <h2>Bedingung – keine automatisch erzeugte E-Mail</h2>
-    <dl class="fields"><dt>Prüfung</dt><dd>deine bestehende Prüfung (Absender / Auto-Reply-Kennzeichen), unverändert</dd></dl>
+    <h2>Bedingung – keine automatische Mail, keine eigene [Avis-Bot]-Mail</h2>
+    <dl class="fields"><dt>Betreff enthält nicht</dt><dd><code>Automatische Antwort</code></dd><dt>Betreff enthält nicht</dt><dd><code>Unzustellbar</code></dd><dt>Betreff enthält nicht</dt><dd><code>[Avis-Bot]</code> – Schleifenschutz: die eigenen Mails des Flows starten ihn nicht erneut</dd></dl>
   </div>
   <div class="arrow"></div>
   <div class="branches uneven">
@@ -161,7 +161,7 @@ pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); p
                           <h2>E-Mail senden (V2)</h2>
                           <dl class="fields">
                             <dt>An</dt><dd>deine Adresse</dd>
-                            <dt>Betreff</dt><dd><code>concat('WG: ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])</code></dd>
+                            <dt>Betreff</dt><dd><code>concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - ', outputs('Run_script')?['body/result/amount'], ' ', outputs('Run_script')?['body/result/currency'])</code></dd>
                             <dt>Text (HTML)</dt><dd><pre>&lt;p&gt;&lt;b&gt;Von:&lt;/b&gt; @{triggerOutputs()?['body/from']}&lt;br&gt;
 &lt;b&gt;Empfangen:&lt;/b&gt; @{formatDateTime(triggerOutputs()?['body/receivedDateTime'], 'dd.MM.yyyy HH:mm')}&lt;br&gt;
 &lt;b&gt;Betreff:&lt;/b&gt; @{triggerOutputs()?['body/subject']}&lt;br&gt;
@@ -193,7 +193,7 @@ pre { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); p
                           <h2>E-Mail senden (V2)</h2>
                           <dl class="fields">
                             <dt>An</dt><dd>deine Adresse</dd>
-                            <dt>Betreff</dt><dd><code>concat('WG: ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')</code></dd>
+                            <dt>Betreff</dt><dd><code>concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')</code></dd>
                             <dt>Text (HTML)</dt><dd><pre>&lt;p&gt;&lt;b&gt;Grund:&lt;/b&gt; @{outputs('Run_script')?['body/result/error']}&lt;br&gt;
 &lt;b&gt;Sicherheit:&lt;/b&gt; @{outputs('Run_script')?['body/result/confidence']} (@{outputs('Run_script')?['body/result/method']})&lt;/p&gt;
 &lt;p&gt;&lt;b&gt;Kandidaten:&lt;/b&gt;&lt;br&gt;@{join(outputs('Run_script')?['body/result/candidates'], '&lt;br&gt;')}&lt;/p&gt;
