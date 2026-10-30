@@ -1,0 +1,1 @@
+concat('[Avis-Bot] ', triggerOutputs()?['body/subject'], ' - Betrag nicht erkannt')
